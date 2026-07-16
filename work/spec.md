@@ -210,7 +210,7 @@ kotomemo v1.0.3 の設計を継承:
 |---|---|---|
 | 1 | Workspace open (フォルダ選択) + file tree + editor タブ + save/reload | 2 日 |
 | 2 | CodeMirror 6 Markdown Live Preview (decoration/widget、Tier B レベル) | 2-3 日 |
-| 3 | 分離 Preview ペイン + Wiki link 解決 + 画像インライン表示 | 2 日 |
+| 3 | 分離 Preview ペイン強化 (画像インライン = asset protocol) + Wiki link 解決 + 画像の取り込み (Ctrl+V ペースト / drag & drop → attachments 保存 → `![]()` 挿入。Tauri の dragDropEnabled 設定に注意) | 2-3 日 |
 | 4 | Workspace 全検索置換 (regex 対応) | 2 日 |
 | 5 | テンプレ変数展開 (`{{today}}` 等) + ショートカット挿入 | 2 日 |
 | 6 | API request 機能 (kotomemo Send palette 移植) | 1-2 日 |
