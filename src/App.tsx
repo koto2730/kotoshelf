@@ -1,13 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import type { EditorView } from "@codemirror/view";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { redo, selectAll, undo } from "@codemirror/commands";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { livePreview } from "./editor/livePreview";
+import { wikiLinkExtension } from "./editor/wikilink";
+import { editorInteractions } from "./editor/interactions";
 import { FileTree } from "./components/FileTree";
 import { TabBar } from "./components/TabBar";
+import { PreviewPane } from "./components/PreviewPane";
 import {
   pickWorkspaceFolder,
   readFile,
@@ -50,6 +55,26 @@ export default function App() {
 
   const activeTab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
   const fontSize = Math.round((14 * zoom) / 100);
+
+  // Markdown mode (Live Preview + wiki links + GFM + fenced-code
+  // highlighting) applies to .md buffers; anything else stays plain.
+  const isMarkdownTab = activeTab?.name.toLowerCase().endsWith(".md") ?? false;
+  const editorExtensions = useMemo(() => {
+    if (!isMarkdownTab) return [];
+    return [
+      markdown({
+        base: markdownLanguage,
+        codeLanguages: languages,
+        extensions: [wikiLinkExtension],
+      }),
+      livePreview(),
+      editorInteractions({
+        onWikiLink: (target) =>
+          setStatus(`[[${target}]] — wiki link resolution lands in Phase 3`),
+        onStatus: setStatus,
+      }),
+    ];
+  }, [isMarkdownTab]);
 
   // ---- workspace ----------------------------------------------------
 
@@ -351,7 +376,7 @@ export default function App() {
               onCreateEditor={(view) => {
                 editorViewRef.current = view;
               }}
-              extensions={[markdown()]}
+              extensions={editorExtensions}
               theme={prefersDark ? oneDark : "light"}
               height="100%"
               style={{ height: "100%", fontSize: `${fontSize}px` }}
@@ -375,14 +400,19 @@ export default function App() {
         </div>
       </main>
 
-      {/* Right: rendered preview (placeholder until Phase 3) */}
-      <aside className="w-96 shrink-0 border-l border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 p-3 overflow-y-auto">
-        <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+      {/* Right: rendered Markdown preview. Relative images + wiki-link
+          resolution still pending (Phase 3). */}
+      <aside className="w-96 shrink-0 border-l border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 overflow-y-auto">
+        <div className="text-xs uppercase tracking-wide text-slate-500 px-3 pt-3">
           Preview
         </div>
-        <pre className="text-sm whitespace-pre-wrap font-mono text-slate-600 dark:text-slate-400">
-          {activeTab?.content ?? ""}
-        </pre>
+        {isMarkdownTab ? (
+          <PreviewPane content={activeTab?.content ?? ""} />
+        ) : (
+          <pre className="text-sm whitespace-pre-wrap font-mono text-slate-600 dark:text-slate-400 p-3">
+            {activeTab?.content ?? ""}
+          </pre>
+        )}
       </aside>
     </div>
   );
