@@ -7,19 +7,36 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { redo, selectAll, undo } from "@codemirror/commands";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { livePreview } from "./editor/livePreview";
 import { wikiLinkExtension } from "./editor/wikilink";
 import { editorInteractions } from "./editor/interactions";
 import { FileTree } from "./components/FileTree";
 import { TabBar } from "./components/TabBar";
 import { PreviewPane } from "./components/PreviewPane";
+import { InputModal, ListPickerModal, SaveFirstModal } from "./components/Modals";
+import { ContextMenu, type MenuAction } from "./components/ContextMenu";
 import {
+  copyInto,
+  createDir,
+  flattenTree,
   pickWorkspaceFolder,
   readFile,
   readTree,
+  renamePath,
+  trashPath,
+  writeBase64File,
   writeFile,
   type TreeNode,
 } from "./lib/fs";
+import {
+  ATTACHMENTS_DIR,
+  dirname,
+  fileToBase64,
+  isImagePath,
+  joinPath,
+  timestampImageStem,
+} from "./lib/attachments";
 import {
   isDirty,
   makeFileTab,
@@ -46,6 +63,24 @@ export default function App() {
   const [activeIndex, setActiveIndex] = useState(-1);
   const [status, setStatus] = useState<string | null>(null);
   const [zoom, setZoom] = useState(100);
+  /** Clipboard image waiting for an Untitled tab to be saved first. */
+  const [pendingImage, setPendingImage] = useState<File | null>(null);
+  /** Wiki-link candidates when [[target]] matches several notes. */
+  const [wikiChoices, setWikiChoices] = useState<
+    { label: string; detail: string; value: string }[] | null
+  >(null);
+  /** Tree context menu (right-click on a node or the tree background). */
+  const [treeMenu, setTreeMenu] = useState<{
+    x: number;
+    y: number;
+    node: TreeNode | null;
+  } | null>(null);
+  /** Pending name prompt for tree operations. */
+  const [namePrompt, setNamePrompt] = useState<{
+    title: string;
+    initial?: string;
+    onSubmit: (value: string) => void;
+  } | null>(null);
 
   const editorViewRef = useRef<EditorView | null>(null);
 
@@ -59,6 +94,15 @@ export default function App() {
   // Markdown mode (Live Preview + wiki links + GFM + fenced-code
   // highlighting) applies to .md buffers; anything else stays plain.
   const isMarkdownTab = activeTab?.name.toLowerCase().endsWith(".md") ?? false;
+
+  // Callbacks used inside the (memoised) editor extensions go through a
+  // ref so the extensions never capture stale state - same pattern as
+  // the native-menu commands ref.
+  const interactionsRef = useRef<{
+    wiki: (target: string) => void;
+    imagePaste: (file: File) => void;
+  }>({ wiki: () => {}, imagePaste: () => {} });
+
   const editorExtensions = useMemo(() => {
     if (!isMarkdownTab) return [];
     return [
@@ -69,9 +113,9 @@ export default function App() {
       }),
       livePreview(),
       editorInteractions({
-        onWikiLink: (target) =>
-          setStatus(`[[${target}]] — wiki link resolution lands in Phase 3`),
+        onWikiLink: (target) => interactionsRef.current.wiki(target),
         onStatus: setStatus,
+        onImagePaste: (file) => interactionsRef.current.imagePaste(file),
       }),
     ];
   }, [isMarkdownTab]);
@@ -133,10 +177,13 @@ export default function App() {
    * the native save dialog; picking a location inside the workspace also
    * refreshes the tree so the new file appears immediately.
    */
+  /** Save the active tab. Returns the saved path, or null when the user
+   * cancelled the dialog / nothing to save / write failed - callers like
+   * the save-then-attach flow need to know whether to continue. */
   const saveActive = useCallback(
-    async (forceDialog = false) => {
+    async (forceDialog = false): Promise<string | null> => {
       const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
-      if (!tab) return;
+      if (!tab) return null;
       let targetPath = tab.path;
       if (forceDialog || targetPath === null) {
         const picked = await saveDialog({
@@ -146,7 +193,7 @@ export default function App() {
             { name: "All files", extensions: ["*"] },
           ],
         });
-        if (!picked) return;
+        if (!picked) return null;
         targetPath = picked;
       }
       try {
@@ -165,8 +212,10 @@ export default function App() {
         );
         setStatus(`Saved ${basename(targetPath)}`);
         if (workspace) void refreshTree(workspace);
+        return targetPath;
       } catch (e) {
         setStatus(`${e}`);
+        return null;
       }
     },
     [activeIndex, tabs, workspace, refreshTree],
@@ -190,6 +239,250 @@ export default function App() {
       });
     },
     [tabs],
+  );
+
+  // ---- attachments (paste / drag & drop) -----------------------------
+
+  const insertAtCursor = useCallback((text: string) => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: text },
+      selection: { anchor: sel.from + text.length },
+    });
+  }, []);
+
+  const attachImageToPath = useCallback(
+    async (tabPath: string, file: File) => {
+      try {
+        const dir = joinPath(dirname(tabPath), ATTACHMENTS_DIR);
+        const ext = file.type.startsWith("image/")
+          ? (file.type.split("/")[1] ?? "png").replace("jpeg", "jpg")
+          : "png";
+        const name = `${timestampImageStem()}.${ext}`;
+        await writeBase64File(joinPath(dir, name), await fileToBase64(file));
+        insertAtCursor(`![](${ATTACHMENTS_DIR}/${name})`);
+        setStatus(`Attached ${name}`);
+        if (workspace) void refreshTree(workspace);
+      } catch (e) {
+        setStatus(`${e}`);
+      }
+    },
+    [insertAtCursor, workspace, refreshTree],
+  );
+
+  const handleImagePaste = useCallback(
+    (file: File) => {
+      const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
+      if (!tab) return;
+      if (tab.path === null) {
+        setPendingImage(file);
+        return;
+      }
+      void attachImageToPath(tab.path, file);
+    },
+    [activeIndex, tabs, attachImageToPath],
+  );
+
+  const saveNowForPending = useCallback(async () => {
+    const file = pendingImage;
+    setPendingImage(null);
+    if (!file) return;
+    const savedPath = await saveActive();
+    if (savedPath) await attachImageToPath(savedPath, file);
+  }, [pendingImage, saveActive, attachImageToPath]);
+
+  // OS file drops arrive via Tauri's drag-drop event (the webview's own
+  // HTML5 drop is intercepted by Tauri when dragDropEnabled, the
+  // default). Images copy into the attachments folder + insert a
+  // reference; anything else opens as a tab.
+  const dropRef = useRef<(paths: string[]) => void>(() => {});
+  dropRef.current = (paths) => {
+    for (const p of paths) {
+      if (isImagePath(p)) {
+        const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
+        if (!tab) {
+          setStatus("Open a tab before dropping images.");
+          continue;
+        }
+        if (tab.path === null) {
+          setStatus("Save this file first to attach dropped images.");
+          continue;
+        }
+        const destDir = joinPath(dirname(tab.path), ATTACHMENTS_DIR);
+        const name = `${timestampImageStem()}-${basename(p)}`;
+        void copyInto(p, destDir, name)
+          .then(() => {
+            insertAtCursor(`![](${ATTACHMENTS_DIR}/${name})`);
+            setStatus(`Attached ${name}`);
+            if (workspace) void refreshTree(workspace);
+          })
+          .catch((e) => setStatus(`${e}`));
+      } else {
+        void openFile(p);
+      }
+    }
+  };
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "drop") dropRef.current(event.payload.paths);
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => unlisten?.();
+  }, []);
+
+  // ---- wiki links -----------------------------------------------------
+
+  const resolveWikiLink = useCallback(
+    (target: string) => {
+      if (!workspace) {
+        setStatus("Open a workspace to resolve wiki links.");
+        return;
+      }
+      const t = target.toLowerCase();
+      const matches = flattenTree(tree).filter(
+        (n) =>
+          !n.isDir &&
+          (n.name.toLowerCase() === `${t}.md` || n.name.toLowerCase() === t),
+      );
+      if (matches.length === 1) {
+        void openFile(matches[0].path);
+        return;
+      }
+      if (matches.length > 1) {
+        setWikiChoices(
+          matches.map((m) => ({ label: m.name, detail: m.path, value: m.path })),
+        );
+        return;
+      }
+      // No match: create the note, Obsidian-style. It lands next to the
+      // current file (workspace root for untitled buffers) and opens
+      // immediately so the link becomes valid the moment it's clicked.
+      const fileName = t.endsWith(".md") ? target : `${target}.md`;
+      const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
+      const dir = tab?.path ? dirname(tab.path) : workspace;
+      const newPath = joinPath(dir, fileName);
+      void (async () => {
+        try {
+          await writeFile(newPath, "");
+          await refreshTree(workspace);
+          await openFile(newPath);
+          setStatus(`Created ${fileName}`);
+        } catch (e) {
+          setStatus(`${e}`);
+        }
+      })();
+    },
+    [workspace, tree, openFile, activeIndex, tabs, refreshTree],
+  );
+
+  // Keep the editor-extension callbacks fresh (see interactionsRef).
+  interactionsRef.current = { wiki: resolveWikiLink, imagePaste: handleImagePaste };
+
+  // ---- tree operations (context menu) ---------------------------------
+
+  /** Directory a "new file/folder here" operation should target. */
+  const menuTargetDir = useCallback(
+    (node: TreeNode | null): string | null => {
+      if (!workspace) return null;
+      if (!node) return workspace;
+      return node.isDir ? node.path : dirname(node.path);
+    },
+    [workspace],
+  );
+
+  const treeMenuActions = useCallback(
+    (node: TreeNode | null): MenuAction[] => {
+      const dir = menuTargetDir(node);
+      if (!dir || !workspace) return [];
+      const actions: MenuAction[] = [
+        {
+          label: "New File…",
+          onClick: () =>
+            setNamePrompt({
+              title: `New file in ${basename(dir)}/`,
+              onSubmit: (name) => {
+                const p = joinPath(dir, name);
+                void writeFile(p, "")
+                  .then(() => refreshTree(workspace))
+                  .then(() => openFile(p))
+                  .catch((e) => setStatus(`${e}`));
+              },
+            }),
+        },
+        {
+          label: "New Folder…",
+          onClick: () =>
+            setNamePrompt({
+              title: `New folder in ${basename(dir)}/`,
+              onSubmit: (name) => {
+                void createDir(joinPath(dir, name))
+                  .then(() => refreshTree(workspace))
+                  .catch((e) => setStatus(`${e}`));
+              },
+            }),
+        },
+      ];
+      if (node) {
+        actions.push(
+          {
+            label: "Rename…",
+            onClick: () =>
+              setNamePrompt({
+                title: `Rename ${node.name}`,
+                initial: node.name,
+                onSubmit: (name) => {
+                  const to = joinPath(dirname(node.path), name);
+                  void renamePath(node.path, to)
+                    .then(() => {
+                      // Follow the rename in any open tabs (files directly,
+                      // and everything under a renamed folder by prefix).
+                      setTabs((prev) =>
+                        prev.map((t) => {
+                          if (!t.path) return t;
+                          if (t.path === node.path) {
+                            return { ...t, path: to, name: basename(to) };
+                          }
+                          if (t.path.startsWith(node.path + "/") ||
+                              t.path.startsWith(node.path + "\\")) {
+                            const suffix = t.path.slice(node.path.length);
+                            return { ...t, path: to + suffix };
+                          }
+                          return t;
+                        }),
+                      );
+                      return refreshTree(workspace);
+                    })
+                    .catch((e) => setStatus(`${e}`));
+                },
+              }),
+          },
+          {
+            label: "Delete (to trash)",
+            danger: true,
+            onClick: () => {
+              if (!window.confirm(`Move "${node.name}" to the trash?`)) return;
+              void trashPath(node.path)
+                .then(() => {
+                  setStatus(`Moved ${node.name} to trash`);
+                  return refreshTree(workspace);
+                })
+                .catch((e) => setStatus(`${e}`));
+              // Tabs pointing at the deleted path stay open (VS Code
+              // behaviour) - saving them recreates the file.
+            },
+          },
+        );
+      }
+      return actions;
+    },
+    [menuTargetDir, workspace, refreshTree, openFile],
   );
 
   // ---- clipboard (menu-driven; keyboard chords are native) -----------
@@ -342,12 +635,22 @@ export default function App() {
             </button>
           )}
         </div>
-        <div className="flex-1 overflow-y-auto p-2">
+        <div
+          className="flex-1 overflow-y-auto p-2"
+          onContextMenu={(e) => {
+            // Right-click on the tree background = workspace-root menu.
+            // Node rows stopPropagation, so this only fires on empty space.
+            if (!workspace) return;
+            e.preventDefault();
+            setTreeMenu({ x: e.clientX, y: e.clientY, node: null });
+          }}
+        >
           {workspace ? (
             <FileTree
               nodes={tree}
               onOpenFile={(p) => void openFile(p)}
               activePath={activeTab?.path ?? null}
+              onNodeMenu={(node, x, y) => setTreeMenu({ x, y, node })}
             />
           ) : (
             <div className="text-sm text-slate-400 italic p-1">
@@ -407,13 +710,50 @@ export default function App() {
           Preview
         </div>
         {isMarkdownTab ? (
-          <PreviewPane content={activeTab?.content ?? ""} />
+          <PreviewPane
+            content={activeTab?.content ?? ""}
+            fileDir={activeTab?.path ? dirname(activeTab.path) : null}
+          />
         ) : (
           <pre className="text-sm whitespace-pre-wrap font-mono text-slate-600 dark:text-slate-400 p-3">
             {activeTab?.content ?? ""}
           </pre>
         )}
       </aside>
+
+      {pendingImage && (
+        <SaveFirstModal
+          onSaveNow={() => void saveNowForPending()}
+          onClose={() => setPendingImage(null)}
+        />
+      )}
+      {wikiChoices && (
+        <ListPickerModal
+          title="Multiple notes match this wiki link"
+          items={wikiChoices}
+          onPick={(path) => {
+            setWikiChoices(null);
+            void openFile(path);
+          }}
+          onClose={() => setWikiChoices(null)}
+        />
+      )}
+      {treeMenu && (
+        <ContextMenu
+          x={treeMenu.x}
+          y={treeMenu.y}
+          actions={treeMenuActions(treeMenu.node)}
+          onClose={() => setTreeMenu(null)}
+        />
+      )}
+      {namePrompt && (
+        <InputModal
+          title={namePrompt.title}
+          initial={namePrompt.initial}
+          onSubmit={namePrompt.onSubmit}
+          onClose={() => setNamePrompt(null)}
+        />
+      )}
     </div>
   );
 }

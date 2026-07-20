@@ -10,10 +10,13 @@ export function FileTree({
   nodes,
   onOpenFile,
   activePath,
+  onNodeMenu,
 }: {
   nodes: TreeNode[];
   onOpenFile: (path: string) => void;
   activePath: string | null;
+  /** Right-click on a tree row. Coordinates are viewport-relative. */
+  onNodeMenu?: (node: TreeNode, x: number, y: number) => void;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
@@ -35,6 +38,7 @@ export function FileTree({
         onToggle={toggle}
         onOpenFile={onOpenFile}
         activePath={activePath}
+        onNodeMenu={onNodeMenu}
       />
     </div>
   );
@@ -47,6 +51,7 @@ function TreeLevel({
   onToggle,
   onOpenFile,
   activePath,
+  onNodeMenu,
 }: {
   nodes: TreeNode[];
   depth: number;
@@ -54,6 +59,7 @@ function TreeLevel({
   onToggle: (path: string) => void;
   onOpenFile: (path: string) => void;
   activePath: string | null;
+  onNodeMenu?: (node: TreeNode, x: number, y: number) => void;
 }) {
   return (
     <>
@@ -71,6 +77,11 @@ function TreeLevel({
             onClick={() =>
               node.isDir ? onToggle(node.path) : onOpenFile(node.path)
             }
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onNodeMenu?.(node, e.clientX, e.clientY);
+            }}
             title={node.path}
           >
             <span className="mr-1 inline-block w-3 text-slate-400">
@@ -96,6 +107,7 @@ function TreeLevel({
               onToggle={onToggle}
               onOpenFile={onOpenFile}
               activePath={activePath}
+              onNodeMenu={onNodeMenu}
             />
           )}
         </div>
