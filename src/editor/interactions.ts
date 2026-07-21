@@ -6,9 +6,13 @@ import { wikiLinkTarget } from "./wikilink";
 
 export interface InteractionHandlers {
   /** [[wiki link]] activated (Ctrl+click). Resolution strategy is the
-   * app's concern (Phase 3: workspace lookup + ambiguity menu). */
+   * app's concern (workspace lookup + ambiguity menu). */
   onWikiLink: (target: string) => void;
   onStatus: (message: string) => void;
+  /** Clipboard image pasted into the editor. The app saves it to the
+   * attachments folder and inserts the reference. Text pastes are left
+   * to CodeMirror's default handling. */
+  onImagePaste?: (file: File) => void;
 }
 
 /**
@@ -19,6 +23,21 @@ export interface InteractionHandlers {
  */
 export function editorInteractions(handlers: InteractionHandlers) {
   return EditorView.domEventHandlers({
+    paste(event) {
+      const items = event.clipboardData?.items;
+      if (!items || !handlers.onImagePaste) return false;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            event.preventDefault();
+            handlers.onImagePaste(file);
+            return true;
+          }
+        }
+      }
+      return false;
+    },
     mousedown(event, view) {
       const target = event.target as HTMLElement;
 

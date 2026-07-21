@@ -78,12 +78,68 @@ fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
+/// Write binary content delivered as base64 (used for clipboard images -
+/// pasting a screenshot sends the PNG bytes over IPC as a base64 string,
+/// which stays comfortably within IPC limits for screenshot-sized data).
+/// Parent directories are created as needed.
+#[tauri::command]
+fn write_base64_file(path: String, contents_base64: String) -> Result<(), String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(contents_base64)
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    if let Some(parent) = Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, bytes).map_err(|e| format!("Failed to write {path}: {e}"))
+}
+
+/// Copy an existing file (e.g. an image dragged in from Explorer) into
+/// `dest_dir/dest_name`, creating the directory as needed. Returns the
+/// destination path.
+#[tauri::command]
+fn copy_into(src: String, dest_dir: String, dest_name: String) -> Result<String, String> {
+    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    let dest = Path::new(&dest_dir).join(&dest_name);
+    std::fs::copy(&src, &dest).map_err(|e| format!("Failed to copy {src}: {e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn create_dir(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path).map_err(|e| format!("Failed to create {path}: {e}"))
+}
+
+#[tauri::command]
+fn rename_path(from: String, to: String) -> Result<(), String> {
+    if Path::new(&to).exists() {
+        return Err(format!("Already exists: {to}"));
+    }
+    std::fs::rename(&from, &to).map_err(|e| format!("Rename failed: {e}"))
+}
+
+/// Move a file or directory to the OS trash / recycle bin. Deliberately
+/// NOT a permanent delete - tree operations should always be recoverable.
+#[tauri::command]
+fn trash_path(path: String) -> Result<(), String> {
+    trash::delete(&path).map_err(|e| format!("Delete failed: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![read_tree, read_file, write_file])
+        .invoke_handler(tauri::generate_handler![
+            read_tree,
+            read_file,
+            write_file,
+            write_base64_file,
+            copy_into,
+            create_dir,
+            rename_path,
+            trash_path
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
