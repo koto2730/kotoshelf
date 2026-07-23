@@ -1,5 +1,123 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+
+// ---------------------------------------------------------------------
+// API presets & HTTP send (Phase 6)
+// ---------------------------------------------------------------------
+
+/// One saved HTTP preset (kotomemo's ApiPreset, ported). Templates
+/// ({{selection}}, {{tokens.NAME}}, ...) are expanded on the frontend
+/// before the request is sent - the Rust side never parses the template
+/// syntax, it only fires the already-resolved request.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiPreset {
+    name: String,
+    url: String,
+    #[serde(default = "default_method")]
+    method: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body_template: String,
+    #[serde(default)]
+    response_json_path: Option<String>,
+    #[serde(default)]
+    response_target: String, // "newTab" | "afterSelection" | "statusOnly"
+}
+
+fn default_method() -> String {
+    "POST".into()
+}
+
+/// App-wide config (NOT per-workspace): presets and secrets live in
+/// ~/.kotoshelf/config.json rather than inside a workspace, so a token
+/// never ends up accidentally committed if the workspace happens to be a
+/// git repo.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    presets: Vec<ApiPreset>,
+    #[serde(default)]
+    tokens: HashMap<String, String>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            presets: Vec::new(),
+            tokens: HashMap::new(),
+        }
+    }
+}
+
+fn app_config_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home.join(".kotoshelf").join("config.json"))
+}
+
+#[tauri::command]
+fn get_app_config() -> AppConfig {
+    app_config_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn set_app_config(config: AppConfig) -> Result<(), String> {
+    let path = app_config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write {path:?}: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+struct SendRequestInput {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    /// None for methods where a body doesn't apply (GET/DELETE with an
+    /// empty template) - kept optional so we don't send an empty-string
+    /// body where the server expects none at all.
+    body: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendRequestOutput {
+    status: u16,
+    body: String,
+}
+
+/// Fires an already-template-resolved HTTP request. Runs in Rust (not
+/// the webview's fetch) so kotoshelf isn't subject to CSP/CORS - the
+/// same reasoning kotomemo's JVM HttpClient had.
+#[tauri::command]
+fn send_request(input: SendRequestInput) -> Result<SendRequestOutput, String> {
+    let client = reqwest::blocking::Client::new();
+    let method = reqwest::Method::from_bytes(input.method.as_bytes())
+        .map_err(|_| format!("Invalid HTTP method: {}", input.method))?;
+    let mut builder = client.request(method, &input.url);
+    for (name, value) in &input.headers {
+        builder = builder.header(name, value);
+    }
+    if let Some(body) = input.body {
+        builder = builder.body(body);
+    }
+    let response = builder
+        .send()
+        .map_err(|e| format!("Request failed: {e}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
+    Ok(SendRequestOutput { status, body })
+}
 
 /// One node of the workspace file tree. `children` is `Some` for
 /// directories (possibly empty) and `None` for files, so the frontend can
@@ -429,7 +547,10 @@ pub fn run() {
             replace_in_files,
             get_search_config,
             set_search_config,
-            get_initial_target
+            get_initial_target,
+            get_app_config,
+            set_app_config,
+            send_request
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

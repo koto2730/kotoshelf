@@ -20,6 +20,8 @@ export interface AppCommands {
   zoomIn: () => void;
   zoomOut: () => void;
   zoomReset: () => void;
+  openSendPalette: () => void;
+  openSettings: () => void;
 }
 
 /**
@@ -89,6 +91,15 @@ export async function installAppMenu(commands: {
     ],
   });
 
-  const menu = await Menu.new({ items: [fileMenu, editMenu, viewMenu] });
+  const sendMenu = await Submenu.new({
+    text: "Send",
+    items: [
+      await MenuItem.new({ text: "Send Palette…", accelerator: "CmdOrCtrl+;", action: run("openSendPalette") }),
+      await PredefinedMenuItem.new({ item: "Separator" }),
+      await MenuItem.new({ text: "Settings…", action: run("openSettings") }),
+    ],
+  });
+
+  const menu = await Menu.new({ items: [fileMenu, editMenu, viewMenu, sendMenu] });
   await menu.setAsAppMenu();
 }
