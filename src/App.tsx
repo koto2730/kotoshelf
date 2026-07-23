@@ -11,6 +11,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { livePreview } from "./editor/livePreview";
 import { wikiLinkExtension } from "./editor/wikilink";
 import { editorInteractions } from "./editor/interactions";
+import { templateExpansion } from "./editor/templateExpansion";
+import type { TemplateContext } from "./lib/templateVars";
 import { FileTree } from "./components/FileTree";
 import { TabBar } from "./components/TabBar";
 import { PreviewPane } from "./components/PreviewPane";
@@ -111,6 +113,22 @@ export default function App() {
     imagePaste: (file: File) => void;
   }>({ wiki: () => {}, imagePaste: () => {} });
 
+  // Template-variable context ({{today}}, {{title}}, ...). A ref, not a
+  // memo dependency: rebuilding editorExtensions (and therefore
+  // remounting CodeMirror) on every keystroke just to keep {{title}}
+  // fresh would be absurd. templateExpansion() reads ctxRef.current at
+  // expansion time instead.
+  const templateCtxRef = useRef<TemplateContext>({
+    filename: "",
+    workspace: "",
+    content: "",
+  });
+  templateCtxRef.current = {
+    filename: activeTab ? activeTab.name.replace(/\.[^.]+$/, "") : "",
+    workspace: workspace ? basename(workspace) : "",
+    content: activeTab?.content ?? "",
+  };
+
   const editorExtensions = useMemo(() => {
     if (!isMarkdownTab) return [];
     return [
@@ -120,12 +138,15 @@ export default function App() {
         extensions: [wikiLinkExtension],
       }),
       livePreview(),
+      templateExpansion(templateCtxRef),
       editorInteractions({
         onWikiLink: (target) => interactionsRef.current.wiki(target),
         onStatus: setStatus,
         onImagePaste: (file) => interactionsRef.current.imagePaste(file),
       }),
     ];
+    // templateCtxRef is a stable ref identity - intentionally excluded.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isMarkdownTab]);
 
   // ---- workspace ----------------------------------------------------
