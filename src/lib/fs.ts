@@ -109,6 +109,17 @@ export function replaceInFiles(
   });
 }
 
+export type InitialTarget =
+  | { kind: "workspace"; path: string }
+  | { kind: "file"; path: string; workspace: string };
+
+/** `kotoshelf <path>` / `kotoshelf .` from the command line, resolved once
+ * at Rust startup. Called on mount; returns null for a plain launch with
+ * no usable argument. */
+export function getInitialTarget(): Promise<InitialTarget | null> {
+  return invoke<InitialTarget | null>("get_initial_target");
+}
+
 /** Depth-first flatten of the workspace tree. */
 export function flattenTree(nodes: TreeNode[]): TreeNode[] {
   const out: TreeNode[] = [];
