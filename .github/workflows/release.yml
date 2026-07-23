@@ -20,6 +20,11 @@ on:
 
 jobs:
   release:
+    # GITHUB_TOKEN is read-only by default; creating/updating a release
+    # needs contents: write. Without this tauri-action fails with
+    # "Resource not accessible by integration" after a successful build.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
