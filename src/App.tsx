@@ -54,6 +54,14 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { getAppConfig, sendRequest, type ApiPreset } from "./lib/apiPresets";
 import { renderTemplate } from "./lib/apiTemplateRenderer";
 import { extractJsonPath } from "./lib/jsonPath";
+import {
+  BUILTIN_LIGHT,
+  getSelectedTheme,
+  resolveTheme,
+  setSelectedTheme,
+  type ResolvedTheme,
+} from "./lib/theme";
+import { ThemeDialog } from "./components/ThemeDialog";
 
 /**
  * Phase 1: workspace + file tree + tabs + native menu.
@@ -97,15 +105,46 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [apiPresets, setApiPresets] = useState<ApiPreset[]>([]);
   const [sendBusy, setSendBusy] = useState(false);
+  const [themeDialogOpen, setThemeDialogOpen] = useState(false);
   /** {line, col, len} to select once the target tab's editor is mounted
    * and active - set by a Search-panel result click, consumed by
    * applyPendingJump. A ref (not state) because it must be readable
    * synchronously from onCreateEditor without waiting for a re-render. */
   const pendingJumpRef = useRef<SearchOpenTarget | null>(null);
 
-  const prefersDark =
-    typeof window !== "undefined" &&
-    window.matchMedia("(prefers-color-scheme: dark)").matches;
+  // ---- theme (Phase 7) -------------------------------------------------
+
+  // Tracked as state (not read once) so a live OS theme change is
+  // reflected immediately when the selection is "system" - matchMedia's
+  // change event, not just the value at mount.
+  const [systemPrefersDark, setSystemPrefersDark] = useState(
+    () => typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = (e: MediaQueryListEvent) => setSystemPrefersDark(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  const [themeSelection, setThemeSelection] = useState("system");
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(BUILTIN_LIGHT);
+
+  useEffect(() => {
+    void getSelectedTheme().then(setThemeSelection);
+  }, []);
+
+  useEffect(() => {
+    void resolveTheme(themeSelection, systemPrefersDark).then(setResolvedTheme);
+  }, [themeSelection, systemPrefersDark]);
+
+  const applyThemeSelection = useCallback(async (name: string) => {
+    setThemeSelection(name);
+    await setSelectedTheme(name);
+  }, []);
+
+  const prefersDark = resolvedTheme.dark;
 
   const activeTab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
   const fontSize = Math.round((14 * zoom) / 100);
@@ -146,7 +185,7 @@ export default function App() {
         codeLanguages: languages,
         extensions: [wikiLinkExtension],
       }),
-      livePreview(),
+      livePreview(resolvedTheme),
       templateExpansion(templateCtxRef),
       editorInteractions({
         onWikiLink: (target) => interactionsRef.current.wiki(target),
@@ -155,8 +194,11 @@ export default function App() {
       }),
     ];
     // templateCtxRef is a stable ref identity - intentionally excluded.
+    // resolvedTheme is intentionally a dependency: a theme switch should
+    // re-render Live Preview's colors immediately, same as any other
+    // markdown-mode extension change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMarkdownTab]);
+  }, [isMarkdownTab, resolvedTheme]);
 
   // ---- workspace ----------------------------------------------------
 
@@ -736,6 +778,7 @@ export default function App() {
     zoomReset: () => setZoom(100),
     openSendPalette: () => setSendPaletteOpen(true),
     openSettings: () => setSettingsOpen(true),
+    openThemeDialog: () => setThemeDialogOpen(true),
   };
 
   useEffect(() => {
@@ -988,6 +1031,13 @@ export default function App() {
             setSettingsOpen(false);
             reloadApiPresets();
           }}
+        />
+      )}
+      {themeDialogOpen && (
+        <ThemeDialog
+          selection={themeSelection}
+          onSelect={(name) => void applyThemeSelection(name)}
+          onClose={() => setThemeDialogOpen(false)}
         />
       )}
     </div>

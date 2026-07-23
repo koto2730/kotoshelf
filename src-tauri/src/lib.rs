@@ -119,6 +119,74 @@ fn send_request(input: SendRequestInput) -> Result<SendRequestOutput, String> {
     Ok(SendRequestOutput { status, body })
 }
 
+// ---------------------------------------------------------------------
+// Custom themes (Phase 7)
+// ---------------------------------------------------------------------
+
+/// Where a theme's editor/syntax colors are read from disk. Rust only
+/// reads and returns raw JSON here - it never validates or interprets
+/// color values, that's the frontend's job (it knows what a CodeMirror
+/// theme spec needs). Kept as serde_json::Value rather than a typed
+/// struct so a hand-edited theme file with a missing/extra field never
+/// fails to load; the frontend's theme resolver fills gaps from the
+/// built-in light theme.
+#[tauri::command]
+fn list_custom_themes() -> Vec<String> {
+    let Some(dir) = themes_dir() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+#[tauri::command]
+fn read_custom_theme(name: String) -> Result<serde_json::Value, String> {
+    let dir = themes_dir().ok_or("Could not determine home directory")?;
+    let path = dir.join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {path:?}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("Invalid theme JSON: {e}"))
+}
+
+fn themes_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".kotoshelf").join("themes"))
+}
+
+fn theme_selection_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".kotoshelf").join("theme.json"))
+}
+
+/// "light" | "dark" | "system" | a custom theme's name. Stored
+/// separately from Phase 6's app config.json (rather than folded into
+/// it) so Phase 6/7 can land independently without one PR's schema
+/// change breaking the other's file format.
+#[tauri::command]
+fn get_selected_theme() -> String {
+    theme_selection_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("selected").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_else(|| "system".to_string())
+}
+
+#[tauri::command]
+fn set_selected_theme(name: String) -> Result<(), String> {
+    let path = theme_selection_path().ok_or("Could not determine home directory")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::json!({ "selected": name });
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap())
+        .map_err(|e| format!("Failed to write {path:?}: {e}"))
+}
+
 /// One node of the workspace file tree. `children` is `Some` for
 /// directories (possibly empty) and `None` for files, so the frontend can
 /// distinguish "empty dir" from "file" without consulting `is_dir` twice.
@@ -550,7 +618,11 @@ pub fn run() {
             get_initial_target,
             get_app_config,
             set_app_config,
-            send_request
+            send_request,
+            list_custom_themes,
+            read_custom_theme,
+            get_selected_theme,
+            set_selected_theme
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,6 +8,7 @@ import {
 } from "@codemirror/view";
 import { RangeSetBuilder, type EditorState } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
+import type { ResolvedTheme } from "../lib/theme";
 
 /**
  * Obsidian-style Live Preview for Markdown, built on CM6 decorations.
@@ -305,52 +306,79 @@ const livePreviewPlugin = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 );
 
-const livePreviewTheme = EditorView.baseTheme({
-  ".cm-lp-h1": { fontSize: "1.6em", fontWeight: "700" },
-  ".cm-lp-h2": { fontSize: "1.4em", fontWeight: "700" },
-  ".cm-lp-h3": { fontSize: "1.2em", fontWeight: "700" },
-  ".cm-lp-h4": { fontSize: "1.1em", fontWeight: "600" },
-  ".cm-lp-h5": { fontSize: "1em", fontWeight: "600" },
-  ".cm-lp-h6": { fontSize: "0.9em", fontWeight: "600", opacity: "0.8" },
-  ".cm-lp-strong": { fontWeight: "700" },
-  ".cm-lp-em": { fontStyle: "italic" },
-  ".cm-lp-strike": { textDecoration: "line-through", opacity: "0.7" },
-  ".cm-lp-inline-code": {
-    fontFamily: "ui-monospace, monospace",
-    borderRadius: "3px",
-  },
-  "&light .cm-lp-inline-code": { backgroundColor: "#e2e8f0" },
-  "&dark .cm-lp-inline-code": { backgroundColor: "#334155" },
-  ".cm-lp-codeblock": { fontFamily: "ui-monospace, monospace" },
-  "&light .cm-lp-codeblock": { backgroundColor: "#f1f5f9" },
-  "&dark .cm-lp-codeblock": { backgroundColor: "#1e293b" },
-  "&light .cm-lp-blockquote": {
-    backgroundColor: "#f8fafc",
-    borderLeft: "3px solid #cbd5e1",
-  },
-  "&dark .cm-lp-blockquote": {
-    backgroundColor: "#0f172a",
-    borderLeft: "3px solid #475569",
-  },
-  ".cm-lp-quote-mark": { opacity: "0.5" },
-  ".cm-lp-list-mark": { color: "#f59e0b", fontWeight: "700" },
-  ".cm-lp-task-done": { textDecoration: "line-through", opacity: "0.6" },
-  ".cm-task-checkbox": {
-    verticalAlign: "middle",
-    margin: "0 0.4em 0 0",
-    cursor: "pointer",
-  },
-  ".cm-lp-link": { color: "#3b82f6", textDecoration: "underline", cursor: "pointer" },
-  ".cm-lp-wikilink": { color: "#8b5cf6", textDecoration: "underline", cursor: "pointer" },
-  ".cm-lp-footnote": { color: "#f59e0b" },
-  ".cm-rendered-hr": {
-    display: "inline-block",
-    width: "100%",
-    borderTop: "2px solid #94a3b8",
-    verticalAlign: "middle",
-  },
-});
+/**
+ * Live Preview styling driven by a ResolvedTheme (Phase 7). Uses
+ * EditorView.theme() rather than baseTheme() - baseTheme is meant for
+ * static, plugin-shipped defaults with the lowest CSS specificity;
+ * theme() is the extension point meant to carry values that change at
+ * runtime, which per-user custom themes are.
+ *
+ * Also carries the editor chrome colors (background/foreground/cursor/
+ * selection/gutter) so the whole editor - not just Live Preview markup -
+ * follows the selected theme.
+ */
+function livePreviewTheme(colors: ResolvedTheme["colors"], dark: boolean) {
+  return EditorView.theme(
+    {
+      "&": {
+        backgroundColor: colors.editorBackground,
+        color: colors.editorForeground,
+      },
+      ".cm-content": { caretColor: colors.cursor },
+      ".cm-cursor, .cm-dropCursor": { borderLeftColor: colors.cursor },
+      "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": {
+        backgroundColor: colors.selection,
+      },
+      ".cm-gutters": {
+        backgroundColor: colors.gutterBackground,
+        color: colors.gutterForeground,
+        border: "none",
+      },
+      ".cm-lp-h1": { fontSize: "1.6em", fontWeight: "700", color: colors.heading },
+      ".cm-lp-h2": { fontSize: "1.4em", fontWeight: "700", color: colors.heading },
+      ".cm-lp-h3": { fontSize: "1.2em", fontWeight: "700", color: colors.heading },
+      ".cm-lp-h4": { fontSize: "1.1em", fontWeight: "600", color: colors.heading },
+      ".cm-lp-h5": { fontSize: "1em", fontWeight: "600", color: colors.heading },
+      ".cm-lp-h6": { fontSize: "0.9em", fontWeight: "600", opacity: "0.8", color: colors.heading },
+      ".cm-lp-strong": { fontWeight: "700", color: colors.strong },
+      ".cm-lp-em": { fontStyle: "italic", color: colors.em },
+      ".cm-lp-strike": { textDecoration: "line-through", opacity: "0.7", color: colors.strike },
+      ".cm-lp-inline-code": {
+        fontFamily: "ui-monospace, monospace",
+        borderRadius: "3px",
+        color: colors.inlineCode,
+        backgroundColor: colors.inlineCodeBackground,
+      },
+      ".cm-lp-codeblock": {
+        fontFamily: "ui-monospace, monospace",
+        backgroundColor: colors.codeblockBackground,
+      },
+      ".cm-lp-blockquote": {
+        backgroundColor: colors.blockquoteBackground,
+        borderLeft: `3px solid ${colors.blockquoteBorder}`,
+      },
+      ".cm-lp-quote-mark": { opacity: "0.5", color: colors.quoteMark },
+      ".cm-lp-list-mark": { color: colors.listMark, fontWeight: "700" },
+      ".cm-lp-task-done": { textDecoration: "line-through", opacity: "0.6", color: colors.taskDone },
+      ".cm-task-checkbox": {
+        verticalAlign: "middle",
+        margin: "0 0.4em 0 0",
+        cursor: "pointer",
+      },
+      ".cm-lp-link": { color: colors.link, textDecoration: "underline", cursor: "pointer" },
+      ".cm-lp-wikilink": { color: colors.wikilink, textDecoration: "underline", cursor: "pointer" },
+      ".cm-lp-footnote": { color: colors.footnote },
+      ".cm-rendered-hr": {
+        display: "inline-block",
+        width: "100%",
+        borderTop: `2px solid ${colors.hr}`,
+        verticalAlign: "middle",
+      },
+    },
+    { dark },
+  );
+}
 
-export function livePreview() {
-  return [livePreviewPlugin, livePreviewTheme];
+export function livePreview(theme: ResolvedTheme) {
+  return [livePreviewPlugin, livePreviewTheme(theme.colors, theme.dark)];
 }
