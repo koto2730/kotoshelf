@@ -21,6 +21,7 @@ import {
   copyInto,
   createDir,
   flattenTree,
+  getInitialTarget,
   pickWorkspaceFolder,
   readFile,
   readTree,
@@ -137,13 +138,20 @@ export default function App() {
     }
   }, []);
 
+  const openWorkspaceAt = useCallback(
+    async (path: string) => {
+      setWorkspace(path);
+      await refreshTree(path);
+      setStatus(`Workspace: ${path}`);
+    },
+    [refreshTree],
+  );
+
   const openFolder = useCallback(async () => {
     const picked = await pickWorkspaceFolder();
     if (!picked) return;
-    setWorkspace(picked);
-    await refreshTree(picked);
-    setStatus(`Workspace: ${picked}`);
-  }, [refreshTree]);
+    await openWorkspaceAt(picked);
+  }, [openWorkspaceAt]);
 
   // ---- tabs ----------------------------------------------------------
 
@@ -201,6 +209,23 @@ export default function App() {
     },
     [openFile, applyPendingJump],
   );
+
+  // `kotoshelf .` / `kotoshelf notes.md` on the command line. Runs once on
+  // mount; a plain launch (no usable arg) resolves to null and is a no-op.
+  useEffect(() => {
+    void getInitialTarget().then((target) => {
+      if (!target) return;
+      if (target.kind === "workspace") {
+        void openWorkspaceAt(target.path);
+      } else {
+        void openWorkspaceAt(target.workspace).then(() => openFile(target.path));
+      }
+    });
+    // Deliberately empty deps: this is a one-shot "what did the shell
+    // launch us with" check, not something that should re-run when
+    // openWorkspaceAt/openFile identities change on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const newFile = useCallback(() => {
     setTabs((prev) => [...prev, makeUntitledTab()]);

@@ -360,11 +360,62 @@ fn replace_in_files(
     Ok(results)
 }
 
+/// What `kotoshelf <arg>` on the command line should do, resolved once at
+/// startup from `std::env::args()`. Relative paths (including `.`) are
+/// resolved against the shell's cwd, not the app's install directory -
+/// otherwise `kotoshelf .` would mean something different depending on
+/// where the binary happens to live.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum InitialTarget {
+    /// Open this directory as the workspace.
+    Workspace { path: String },
+    /// Open this file as a tab, and its parent directory as the
+    /// workspace (so the tree is populated - a bare "open one file"
+    /// with no tree would be a degraded experience here since the tree
+    /// is central to the app, unlike a single-file-focused editor).
+    File { path: String, workspace: String },
+}
+
+fn resolve_initial_target() -> Option<InitialTarget> {
+    // First positional argument after the executable, skipping anything
+    // that looks like a flag - Tauri/webview may inject its own args in
+    // dev mode (e.g. --no-sandbox on some platforms).
+    let arg = std::env::args().skip(1).find(|a| !a.starts_with('-'))?;
+    let cwd = std::env::current_dir().ok()?;
+    let resolved = cwd.join(&arg);
+    let canonical = resolved.canonicalize().unwrap_or(resolved);
+    if canonical.is_dir() {
+        Some(InitialTarget::Workspace {
+            path: canonical.to_string_lossy().into_owned(),
+        })
+    } else if canonical.is_file() {
+        let workspace = canonical.parent()?.to_string_lossy().into_owned();
+        Some(InitialTarget::File {
+            path: canonical.to_string_lossy().into_owned(),
+            workspace,
+        })
+    } else {
+        None // arg didn't resolve to anything on disk - ignore rather than error
+    }
+}
+
+/// Frontend calls this once on mount to pick up `kotoshelf <path>` /
+/// `kotoshelf .` from the command line.
+#[tauri::command]
+fn get_initial_target(state: tauri::State<InitialTargetState>) -> Option<InitialTarget> {
+    state.0.clone()
+}
+
+struct InitialTargetState(Option<InitialTarget>);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let initial_target = resolve_initial_target();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(InitialTargetState(initial_target))
         .invoke_handler(tauri::generate_handler![
             read_tree,
             read_file,
@@ -377,7 +428,8 @@ pub fn run() {
             search_workspace,
             replace_in_files,
             get_search_config,
-            set_search_config
+            set_search_config,
+            get_initial_target
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
