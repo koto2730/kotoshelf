@@ -1,0 +1,64 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#64748b"/>
+      <stop offset="100%" stop-color="#334155"/>
+    </linearGradient>
+    <linearGradient id="shelfWood" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a16207"/>
+      <stop offset="100%" stop-color="#78350f"/>
+    </linearGradient>
+  </defs>
+
+  <!-- App icon background: rounded square, matches macOS/Windows squircle conventions -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- Bookshelf frame (the "shelf" in KotoShelf) -->
+  <g>
+    <!-- Outer shelf frame -->
+    <rect x="152" y="220" width="720" height="600" rx="28" fill="url(#shelfWood)"/>
+    <rect x="152" y="220" width="720" height="600" rx="28" fill="none" stroke="#451a03" stroke-width="10"/>
+
+    <!-- Inner shelf cavity (lighter, recessed) -->
+    <rect x="196" y="264" width="632" height="512" rx="14" fill="#fef3c7" opacity="0.12"/>
+
+    <!-- Middle shelf divider -->
+    <rect x="196" y="512" width="632" height="20" fill="#451a03"/>
+
+    <!-- Books on top shelf: varied heights/colors, leaning slightly, like a real shelf -->
+    <g>
+      <rect x="222" y="308" width="58" height="188" rx="6" fill="#f97316"/>
+      <rect x="288" y="288" width="52" height="208" rx="6" fill="#fbbf24" transform="rotate(-4 314 392)"/>
+      <rect x="348" y="316" width="48" height="180" rx="6" fill="#ef4444"/>
+      <rect x="404" y="300" width="56" height="196" rx="6" fill="#22c55e"/>
+      <rect x="468" y="322" width="50" height="174" rx="6" fill="#f97316" transform="rotate(3 493 409)"/>
+      <rect x="526" y="296" width="54" height="200" rx="6" fill="#facc15"/>
+      <!-- One book leaning against the others, half-open, hinting at "open document" -->
+      <rect x="596" y="330" width="150" height="166" rx="8" fill="#fef9f3" transform="rotate(9 671 413)"/>
+      <rect x="596" y="330" width="150" height="166" rx="8" fill="none" stroke="#d4a373" stroke-width="6" transform="rotate(9 671 413)"/>
+    </g>
+
+    <!-- Bottom shelf: a note/memo pad peeking out, plus one more book stack -->
+    <g>
+      <!-- Note pad with a folded corner and horizontal lines -->
+      <rect x="228" y="596" width="230" height="176" rx="10" fill="#fefce8"/>
+      <rect x="228" y="596" width="230" height="176" rx="10" fill="none" stroke="#eab308" stroke-width="6"/>
+      <path d="M 458 596 L 458 636 L 418 596 Z" fill="#fde047"/>
+      <line x1="256" y1="654" x2="430" y2="654" stroke="#ca8a04" stroke-width="8" stroke-linecap="round"/>
+      <line x1="256" y1="686" x2="430" y2="686" stroke="#ca8a04" stroke-width="8" stroke-linecap="round"/>
+      <line x1="256" y1="718" x2="390" y2="718" stroke="#ca8a04" stroke-width="8" stroke-linecap="round"/>
+
+      <!-- Small book stack -->
+      <rect x="500" y="700" width="170" height="30" rx="6" fill="#3b82f6"/>
+      <rect x="512" y="666" width="146" height="30" rx="6" fill="#f97316"/>
+      <rect x="500" y="632" width="170" height="30" rx="6" fill="#22c55e"/>
+
+      <!-- Pencil resting diagonally on top, a light "editing" nod -->
+      <g transform="rotate(35 700 640)">
+        <rect x="670" y="600" width="16" height="130" rx="6" fill="#facc15"/>
+        <path d="M 670 600 L 686 600 L 678 578 Z" fill="#78350f"/>
+        <rect x="670" y="722" width="16" height="10" fill="#f43f5e"/>
+      </g>
+    </g>
+  </g>
+</svg>

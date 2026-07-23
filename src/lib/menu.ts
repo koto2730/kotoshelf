@@ -22,6 +22,7 @@ export interface AppCommands {
   zoomReset: () => void;
   openSendPalette: () => void;
   openSettings: () => void;
+  openThemeDialog: () => void;
 }
 
 /**
@@ -88,6 +89,8 @@ export async function installAppMenu(commands: {
       await MenuItem.new({ text: "Zoom In", accelerator: "CmdOrCtrl+=", action: run("zoomIn") }),
       await MenuItem.new({ text: "Zoom Out", accelerator: "CmdOrCtrl+-", action: run("zoomOut") }),
       await MenuItem.new({ text: "Reset Zoom (100%)", accelerator: "CmdOrCtrl+0", action: run("zoomReset") }),
+      await PredefinedMenuItem.new({ item: "Separator" }),
+      await MenuItem.new({ text: "Theme…", action: run("openThemeDialog") }),
     ],
   });
 
