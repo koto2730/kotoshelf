@@ -27,4 +27,6 @@ base64 = "0.22.1"
 trash = "5.2.6"
 regex = "1.13.1"
 globset = "0.4.19"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "blocking"] }
+dirs = "6.0.0"
 

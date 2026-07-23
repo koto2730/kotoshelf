@@ -16,3 +16,13 @@ body {
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
     Arial, "Noto Sans JP", sans-serif;
 }
+
+/* Shared form-control look for SettingsDialog (text inputs, selects,
+   textareas). Kept as a single class rather than repeating the utility
+   string on every element. */
+.input {
+  @apply rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 py-1 outline-none;
+}
+.input:focus {
+  @apply border-blue-500;
+}

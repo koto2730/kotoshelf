@@ -49,6 +49,11 @@ import {
   type Tab,
 } from "./lib/tabs";
 import { dedup, installAppMenu, type AppCommands } from "./lib/menu";
+import { SendPalette } from "./components/SendPalette";
+import { SettingsDialog } from "./components/SettingsDialog";
+import { getAppConfig, sendRequest, type ApiPreset } from "./lib/apiPresets";
+import { renderTemplate } from "./lib/apiTemplateRenderer";
+import { extractJsonPath } from "./lib/jsonPath";
 
 /**
  * Phase 1: workspace + file tree + tabs + native menu.
@@ -88,6 +93,10 @@ export default function App() {
 
   const editorViewRef = useRef<EditorView | null>(null);
   const [leftPane, setLeftPane] = useState<"files" | "search">("files");
+  const [sendPaletteOpen, setSendPaletteOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [apiPresets, setApiPresets] = useState<ApiPreset[]>([]);
+  const [sendBusy, setSendBusy] = useState(false);
   /** {line, col, len} to select once the target tab's editor is mounted
    * and active - set by a Search-panel result click, consumed by
    * applyPendingJump. A ref (not state) because it must be readable
@@ -619,6 +628,84 @@ export default function App() {
     }
   }, []);
 
+  // ---- API presets / Send palette (Phase 6) ---------------------------
+
+  // Loaded once on mount and refreshed whenever Settings closes, so a
+  // freshly-added preset shows up in the palette without a restart.
+  const reloadApiPresets = useCallback(() => {
+    void getAppConfig().then((config) => setApiPresets(config.presets));
+  }, []);
+
+  useEffect(() => {
+    reloadApiPresets();
+  }, [reloadApiPresets]);
+
+  const sendWithPreset = useCallback(
+    async (preset: ApiPreset) => {
+      setSendPaletteOpen(false);
+      const view = editorViewRef.current;
+      const tab = activeTab;
+      if (!view || !tab || sendBusy) return;
+      const sel = view.state.selection.main;
+      const selectionText = sel.empty
+        ? view.state.doc.toString()
+        : view.state.sliceDoc(sel.from, sel.to);
+
+      setSendBusy(true);
+      setStatus(`Sending to '${preset.name}'…`);
+      try {
+        const config = await getAppConfig();
+        const ctx = {
+          selection: selectionText,
+          filename: tab.name.replace(/\.[^.]+$/, ""),
+          tokens: config.tokens,
+        };
+        const url = renderTemplate(preset.url, ctx);
+        const body = preset.bodyTemplate
+          ? renderTemplate(preset.bodyTemplate, ctx)
+          : null;
+        const headers: [string, string][] = preset.headers.map(([k, v]) => [
+          k,
+          renderTemplate(v, ctx),
+        ]);
+
+        const response = await sendRequest({ url, method: preset.method, headers, body });
+        if (response.status < 200 || response.status >= 300) {
+          setStatus(`Send failed: HTTP ${response.status}`);
+          return;
+        }
+        const extracted = preset.responseJsonPath
+          ? extractJsonPath(response.body, preset.responseJsonPath) ?? response.body
+          : response.body;
+
+        if (preset.responseTarget === "newTab") {
+          const newTab = makeUntitledTab();
+          newTab.content = extracted;
+          setTabs((prev) => [...prev, newTab]);
+          setActiveIndex(tabs.length);
+        } else if (preset.responseTarget === "afterSelection") {
+          const end = sel.to;
+          const needsNewlineBefore =
+            end > 0 && view.state.sliceDoc(end - 1, end) !== "\n";
+          const needsNewlineAfter = !extracted.endsWith("\n");
+          const payload =
+            (needsNewlineBefore ? "\n" : "") +
+            extracted +
+            (needsNewlineAfter ? "\n" : "");
+          view.dispatch({ changes: { from: end, to: end, insert: payload } });
+          onEdit(view.state.doc.toString());
+        }
+        // "statusOnly" falls through to just the status-bar message below.
+        setStatus(`Send OK (${response.status})`);
+      } catch (e) {
+        setStatus(`Send failed: ${e}`);
+      } finally {
+        setSendBusy(false);
+      }
+    },
+    [activeTab, sendBusy, tabs.length, onEdit],
+  );
+
   // ---- command surface for the native menu ---------------------------
 
   const commandsRef = useRef<AppCommands>(null as unknown as AppCommands);
@@ -647,6 +734,8 @@ export default function App() {
     zoomIn: () => setZoom((z) => Math.min(z + 10, 300)),
     zoomOut: () => setZoom((z) => Math.max(z - 10, 50)),
     zoomReset: () => setZoom(100),
+    openSendPalette: () => setSendPaletteOpen(true),
+    openSettings: () => setSettingsOpen(true),
   };
 
   useEffect(() => {
@@ -685,6 +774,9 @@ export default function App() {
       } else if (key === "0") {
         e.preventDefault();
         dedup("zoomReset", c.zoomReset);
+      } else if (e.key === ";") {
+        e.preventDefault();
+        dedup("openSendPalette", c.openSendPalette);
       }
     };
     window.addEventListener("keydown", handler, { capture: true });
@@ -881,6 +973,21 @@ export default function App() {
           initial={namePrompt.initial}
           onSubmit={namePrompt.onSubmit}
           onClose={() => setNamePrompt(null)}
+        />
+      )}
+      {sendPaletteOpen && (
+        <SendPalette
+          presets={apiPresets}
+          onPick={(preset) => void sendWithPreset(preset)}
+          onClose={() => setSendPaletteOpen(false)}
+        />
+      )}
+      {settingsOpen && (
+        <SettingsDialog
+          onClose={() => {
+            setSettingsOpen(false);
+            reloadApiPresets();
+          }}
         />
       )}
     </div>
