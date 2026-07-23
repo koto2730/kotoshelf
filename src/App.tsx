@@ -16,6 +16,7 @@ import { TabBar } from "./components/TabBar";
 import { PreviewPane } from "./components/PreviewPane";
 import { InputModal, ListPickerModal, SaveFirstModal } from "./components/Modals";
 import { ContextMenu, type MenuAction } from "./components/ContextMenu";
+import { SearchPanel, type SearchOpenTarget } from "./components/SearchPanel";
 import {
   copyInto,
   createDir,
@@ -83,6 +84,12 @@ export default function App() {
   } | null>(null);
 
   const editorViewRef = useRef<EditorView | null>(null);
+  const [leftPane, setLeftPane] = useState<"files" | "search">("files");
+  /** {line, col, len} to select once the target tab's editor is mounted
+   * and active - set by a Search-panel result click, consumed by
+   * applyPendingJump. A ref (not state) because it must be readable
+   * synchronously from onCreateEditor without waiting for a re-render. */
+  const pendingJumpRef = useRef<SearchOpenTarget | null>(null);
 
   const prefersDark =
     typeof window !== "undefined" &&
@@ -156,6 +163,43 @@ export default function App() {
       }
     },
     [tabs],
+  );
+
+  /** Apply pendingJumpRef to the live editor, if the active tab matches
+   * and the view is mounted. Called both from onCreateEditor (new-tab
+   * case, where CM just mounted) and from an effect keyed on the active
+   * tab (already-open-tab case, where no remount happens so
+   * onCreateEditor never fires again). */
+  const applyPendingJump = useCallback(() => {
+    const jump = pendingJumpRef.current;
+    const view = editorViewRef.current;
+    if (!jump || !view || activeTab?.path !== jump.path) return;
+    try {
+      const doc = view.state.doc;
+      const lineInfo = doc.line(Math.min(Math.max(jump.line, 1), doc.lines));
+      const from = lineInfo.from + Math.min(jump.col, lineInfo.length);
+      const to = Math.min(from + jump.len, lineInfo.to);
+      view.dispatch({ selection: { anchor: from, head: to }, scrollIntoView: true });
+      view.focus();
+    } catch {
+      // Line/col out of range (file changed since search ran) - ignore.
+    }
+    pendingJumpRef.current = null;
+  }, [activeTab?.path]);
+
+  useEffect(() => {
+    applyPendingJump();
+  }, [applyPendingJump]);
+
+  const handleSearchOpenMatch = useCallback(
+    async (target: SearchOpenTarget) => {
+      pendingJumpRef.current = target;
+      await openFile(target.path);
+      // Covers the "already open, no remount" case; the effect above
+      // covers the "just mounted a new tab" case.
+      applyPendingJump();
+    },
+    [openFile, applyPendingJump],
   );
 
   const newFile = useCallback(() => {
@@ -606,58 +650,96 @@ export default function App() {
 
   return (
     <div className="flex h-screen text-slate-900 dark:text-slate-100 bg-white dark:bg-slate-950">
-      {/* Left: workspace file tree */}
-      <aside className="w-64 shrink-0 border-r border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex flex-col">
-        <div className="p-2 flex items-center gap-1 border-b border-slate-200 dark:border-slate-800">
-          <button
-            type="button"
-            className="flex-1 text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
-            onClick={() => void openFolder()}
-          >
-            Open Folder…
-          </button>
-          <button
-            type="button"
-            className="text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
-            title="New file (Ctrl+N)"
-            onClick={newFile}
-          >
-            ＋
-          </button>
-          {workspace && (
+      {/* Left: workspace file tree / search */}
+      <aside className="w-72 shrink-0 border-r border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex flex-col">
+        {workspace && (
+          <div className="flex border-b border-slate-200 dark:border-slate-800">
             <button
               type="button"
-              className="text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
-              title="Refresh tree"
-              onClick={() => void refreshTree(workspace)}
+              className={
+                "flex-1 text-xs uppercase tracking-wide py-1.5 " +
+                (leftPane === "files"
+                  ? "border-b-2 border-blue-500 text-slate-900 dark:text-slate-100"
+                  : "text-slate-400 hover:text-slate-600 dark:hover:text-slate-300")
+              }
+              onClick={() => setLeftPane("files")}
             >
-              ⟳
+              Files
             </button>
-          )}
-        </div>
-        <div
-          className="flex-1 overflow-y-auto p-2"
-          onContextMenu={(e) => {
-            // Right-click on the tree background = workspace-root menu.
-            // Node rows stopPropagation, so this only fires on empty space.
-            if (!workspace) return;
-            e.preventDefault();
-            setTreeMenu({ x: e.clientX, y: e.clientY, node: null });
-          }}
-        >
-          {workspace ? (
-            <FileTree
-              nodes={tree}
-              onOpenFile={(p) => void openFile(p)}
-              activePath={activeTab?.path ?? null}
-              onNodeMenu={(node, x, y) => setTreeMenu({ x, y, node })}
-            />
-          ) : (
-            <div className="text-sm text-slate-400 italic p-1">
-              No folder opened yet.
+            <button
+              type="button"
+              className={
+                "flex-1 text-xs uppercase tracking-wide py-1.5 " +
+                (leftPane === "search"
+                  ? "border-b-2 border-blue-500 text-slate-900 dark:text-slate-100"
+                  : "text-slate-400 hover:text-slate-600 dark:hover:text-slate-300")
+              }
+              onClick={() => setLeftPane("search")}
+            >
+              Search
+            </button>
+          </div>
+        )}
+        {leftPane === "search" && workspace ? (
+          <SearchPanel
+            workspace={workspace}
+            onOpenMatch={(target) => void handleSearchOpenMatch(target)}
+            onStatus={setStatus}
+          />
+        ) : (
+          <>
+            <div className="p-2 flex items-center gap-1 border-b border-slate-200 dark:border-slate-800">
+              <button
+                type="button"
+                className="flex-1 text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
+                onClick={() => void openFolder()}
+              >
+                Open Folder…
+              </button>
+              <button
+                type="button"
+                className="text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
+                title="New file (Ctrl+N)"
+                onClick={newFile}
+              >
+                ＋
+              </button>
+              {workspace && (
+                <button
+                  type="button"
+                  className="text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
+                  title="Refresh tree"
+                  onClick={() => void refreshTree(workspace)}
+                >
+                  ⟳
+                </button>
+              )}
             </div>
-          )}
-        </div>
+            <div
+              className="flex-1 overflow-y-auto p-2"
+              onContextMenu={(e) => {
+                // Right-click on the tree background = workspace-root menu.
+                // Node rows stopPropagation, so this only fires on empty space.
+                if (!workspace) return;
+                e.preventDefault();
+                setTreeMenu({ x: e.clientX, y: e.clientY, node: null });
+              }}
+            >
+              {workspace ? (
+                <FileTree
+                  nodes={tree}
+                  onOpenFile={(p) => void openFile(p)}
+                  activePath={activeTab?.path ?? null}
+                  onNodeMenu={(node, x, y) => setTreeMenu({ x, y, node })}
+                />
+              ) : (
+                <div className="text-sm text-slate-400 italic p-1">
+                  No folder opened yet.
+                </div>
+              )}
+            </div>
+          </>
+        )}
       </aside>
 
       {/* Center: tab bar + editor */}
@@ -678,6 +760,7 @@ export default function App() {
               onChange={onEdit}
               onCreateEditor={(view) => {
                 editorViewRef.current = view;
+                applyPendingJump();
               }}
               extensions={editorExtensions}
               theme={prefersDark ? oneDark : "light"}

@@ -50,6 +50,65 @@ export function trashPath(path: string): Promise<void> {
   return invoke("trash_path", { path });
 }
 
+export interface SearchMatch {
+  line: number; // 1-based
+  col: number; // 0-based char offset into the line
+  len: number;
+  preview: string;
+}
+
+export interface FileSearchResult {
+  path: string;
+  matches: SearchMatch[];
+}
+
+export function searchWorkspace(
+  root: string,
+  query: string,
+  isRegex: boolean,
+  caseSensitive: boolean,
+): Promise<FileSearchResult[]> {
+  return invoke<FileSearchResult[]>("search_workspace", {
+    root,
+    query,
+    isRegex,
+    caseSensitive,
+  });
+}
+
+export interface ReplaceResult {
+  path: string;
+  count: number;
+}
+
+export interface SearchConfig {
+  exclude: string[];
+}
+
+export function getSearchConfig(root: string): Promise<SearchConfig> {
+  return invoke<SearchConfig>("get_search_config", { root });
+}
+
+export function setSearchConfig(root: string, config: SearchConfig): Promise<void> {
+  return invoke("set_search_config", { root, config });
+}
+
+export function replaceInFiles(
+  paths: string[],
+  query: string,
+  replacement: string,
+  isRegex: boolean,
+  caseSensitive: boolean,
+): Promise<ReplaceResult[]> {
+  return invoke<ReplaceResult[]>("replace_in_files", {
+    paths,
+    query,
+    replacement,
+    isRegex,
+    caseSensitive,
+  });
+}
+
 /** Depth-first flatten of the workspace tree. */
 export function flattenTree(nodes: TreeNode[]): TreeNode[] {
   const out: TreeNode[] = [];
