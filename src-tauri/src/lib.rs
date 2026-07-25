@@ -951,8 +951,18 @@ fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<()
     let mut ssh_args: Vec<String> = vec!["-t".into()];
     ssh_args.extend(ssh_common_args(&profile, false));
     ssh_args.push(ssh_target(&profile));
+    // Setting $TERM on our own spawned wt.exe/cmd process (below) isn't
+    // reliable: if a Windows Terminal window is already open, wt.exe
+    // hands the new tab off to that *existing* window's process, whose
+    // environment is whatever it was when that window first launched -
+    // our env() never reaches the actual ssh child. Exporting TERM as
+    // part of the remote command itself sidesteps that entirely: it's
+    // set in the remote shell regardless of what the local ssh process's
+    // own environment looked like. Without a real TERM, remote
+    // capability-detecting tools (ls, git, a colored prompt) see
+    // TERM unset/empty and silently skip color output.
     ssh_args.push(format!(
-        "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+        "export TERM=xterm-256color; cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
         shell_quote(&profile.remote_path)
     ));
 
