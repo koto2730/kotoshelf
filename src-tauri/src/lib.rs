@@ -931,20 +931,17 @@ fn ssh_test_connection(profile: SshProfile, ssh_command_path: String) -> Result<
 /// workspace folder over SSH. Best-effort per platform: Windows Terminal
 /// (falling back to a plain console) is exercised in development; the
 /// macOS/Linux branches follow the same shape but are unverified here.
+///
+/// Deliberately NOT multiplexed (`ssh_common_args(&profile, false)`):
+/// `-t` (pty allocation) combined with `ControlMaster=auto` (becoming
+/// the connection's master) is a known-flaky combination on at least
+/// some Windows ssh builds - it failed with "getsockname failed: Not a
+/// socket" even with no stale socket involved, unlike the plain
+/// output-capturing calls elsewhere, where multiplexing works fine. A
+/// terminal is opened rarely enough that paying a full handshake each
+/// time isn't worth that risk.
 #[tauri::command]
 fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<(), String> {
-    // The terminal itself is a detached, interactive process we never
-    // observe the outcome of, so run_ssh_capture's usual "retry once
-    // without multiplexing" self-healing can't apply here - a stale
-    // ControlMaster socket would just fail silently inside the opened
-    // window. Do a harmless warmup round trip first: run_ssh_capture's
-    // existing retry logic clears a stale socket as a side effect on
-    // failure, so by the time we actually launch the terminal below, any
-    // leftover socket has already been cleaned up. Its result doesn't
-    // matter beyond that - a real connection failure surfaces from the
-    // terminal itself either way.
-    let _ = run_ssh_capture(&ssh_command_path, &profile, "true");
-
     let bin = if ssh_command_path.trim().is_empty() {
         "ssh".to_string()
     } else {
@@ -952,7 +949,7 @@ fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<()
     };
 
     let mut ssh_args: Vec<String> = vec!["-t".into()];
-    ssh_args.extend(ssh_common_args(&profile, true));
+    ssh_args.extend(ssh_common_args(&profile, false));
     ssh_args.push(ssh_target(&profile));
     ssh_args.push(format!(
         "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
