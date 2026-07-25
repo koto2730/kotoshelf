@@ -958,13 +958,28 @@ fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<()
 
     #[cfg(target_os = "windows")]
     {
+        // wt.exe/cmd don't set $TERM the way an interactive shell
+        // normally would before you type `ssh host` yourself - ssh here
+        // is spawned directly as the tab's process, with no shell in
+        // between to set it. Without $TERM, ssh forwards an empty value
+        // to the remote pty-req, so remote-side color/capability
+        // detection (ls, git, a colored prompt) silently falls back to
+        // plain output. Force a broadly-supported value explicitly.
+        const TERM_VALUE: &str = "xterm-256color";
         // Prefer Windows Terminal; fall back to a plain console host if
         // it isn't installed.
-        if Command::new("wt.exe").arg(&bin).args(&ssh_args).spawn().is_err() {
+        if Command::new("wt.exe")
+            .arg(&bin)
+            .args(&ssh_args)
+            .env("TERM", TERM_VALUE)
+            .spawn()
+            .is_err()
+        {
             Command::new("cmd")
                 .args(["/C", "start", ""])
                 .arg(&bin)
                 .args(&ssh_args)
+                .env("TERM", TERM_VALUE)
                 .spawn()
                 .map_err(|e| format!("Failed to open a terminal: {e}"))?;
         }
