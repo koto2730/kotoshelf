@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { ApiPreset } from "../lib/apiPresets";
 
 /** Ctrl+; preset picker, ported from kotomemo's SendPaletteDialog:
@@ -16,32 +16,33 @@ export function SendPalette({
 }) {
   const [highlight, setHighlight] = useState(0);
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        onClose();
-        return;
-      }
-      if (e.key === "Enter") {
-        if (presets[highlight]) onPick(presets[highlight]);
-        return;
-      }
-      if (e.key === "ArrowDown") {
-        setHighlight((h) => Math.min(h + 1, presets.length - 1));
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        setHighlight((h) => Math.max(h - 1, 0));
-        return;
-      }
-      if (/^[0-9]$/.test(e.key)) {
-        const idx = e.key === "0" ? 9 : Number(e.key) - 1;
-        if (presets[idx]) onPick(presets[idx]);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [presets, highlight, onPick, onClose]);
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      onClose();
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (presets[highlight]) onPick(presets[highlight]);
+      return;
+    }
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setHighlight((h) => Math.min(h + 1, presets.length - 1));
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setHighlight((h) => Math.max(h - 1, 0));
+      return;
+    }
+    if (/^[0-9]$/.test(e.key)) {
+      e.preventDefault();
+      const idx = e.key === "0" ? 9 : Number(e.key) - 1;
+      if (presets[idx]) onPick(presets[idx]);
+    }
+  };
 
   return (
     <div
@@ -49,7 +50,17 @@ export function SendPalette({
       onClick={onClose}
     >
       <div
-        className="w-[480px] max-h-[60vh] overflow-y-auto rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl py-1"
+        // The dialog must own keyboard focus while open: without it, the
+        // still-focused CodeMirror editor behind it *also* receives every
+        // keydown (digits, Enter, arrows), and since editor text was
+        // selected right before Ctrl+; was pressed, typing e.g. "1" to
+        // pick a preset replaced the selection with the digit - the
+        // selected text silently vanished from the document. autoFocus +
+        // handling keys here (with preventDefault) stops that fallthrough.
+        autoFocus
+        tabIndex={-1}
+        onKeyDown={handleKeyDown}
+        className="w-[480px] max-h-[60vh] overflow-y-auto rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl py-1 outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         {presets.length === 0 ? (
