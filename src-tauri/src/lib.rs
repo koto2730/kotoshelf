@@ -968,28 +968,25 @@ fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<()
 
     #[cfg(target_os = "windows")]
     {
-        // wt.exe/cmd don't set $TERM the way an interactive shell
-        // normally would before you type `ssh host` yourself - ssh here
-        // is spawned directly as the tab's process, with no shell in
-        // between to set it. Without $TERM, ssh forwards an empty value
-        // to the remote pty-req, so remote-side color/capability
-        // detection (ls, git, a colored prompt) silently falls back to
-        // plain output. Force a broadly-supported value explicitly.
-        const TERM_VALUE: &str = "xterm-256color";
-        // Prefer Windows Terminal; fall back to a plain console host if
-        // it isn't installed.
-        if Command::new("wt.exe")
-            .arg(&bin)
-            .args(&ssh_args)
-            .env("TERM", TERM_VALUE)
-            .spawn()
-            .is_err()
-        {
-            Command::new("cmd")
-                .args(["/C", "start", ""])
-                .arg(&bin)
+        use std::os::windows::process::CommandExt;
+        // Windows API constant (winbase.h) - CreateProcess allocates a
+        // new console window for the child instead of inheriting ours.
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+        // Prefer Windows Terminal for a nicer tabbed window. If it isn't
+        // installed/reachable, fall back to spawning ssh directly into a
+        // brand-new plain console - NOT via `cmd /c start`, which failed
+        // in testing: cmd.exe re-parses its command-line argument with
+        // its own quoting/operator rules (&&, ;, quotes are all special
+        // to it too), so the ssh remote-command string above - which
+        // legitimately contains all of those - came out corrupted
+        // ("file not found" trying to run a mangled fragment of it).
+        // Spawning ssh directly sidesteps that: Rust's Command passes
+        // args through standard Win32 argv escaping, no shell involved.
+        if Command::new("wt.exe").arg(&bin).args(&ssh_args).spawn().is_err() {
+            Command::new(&bin)
                 .args(&ssh_args)
-                .env("TERM", TERM_VALUE)
+                .creation_flags(CREATE_NEW_CONSOLE)
                 .spawn()
                 .map_err(|e| format!("Failed to open a terminal: {e}"))?;
         }
