@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { SshProfile } from "./ssh";
 
 export type ResponseTarget = "newTab" | "afterSelection" | "statusOnly";
 
@@ -29,6 +30,9 @@ export function newPreset(name: string): ApiPreset {
 export interface AppConfig {
   presets: ApiPreset[];
   tokens: Record<string, string>;
+  sshProfiles: SshProfile[];
+  /** Empty means "ssh" resolved from PATH. */
+  sshCommandPath: string;
 }
 
 export function getAppConfig(): Promise<AppConfig> {

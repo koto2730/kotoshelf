@@ -57,7 +57,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       ...p,
       headers: textToHeaders(headerDrafts[i] ?? ""),
     }));
-    await setAppConfig({ presets: finalPresets, tokens });
+    // Preserve fields this dialog doesn't manage (SSH profiles/command
+    // path) rather than clobbering them with an incomplete config.
+    const current = await getAppConfig();
+    await setAppConfig({ ...current, presets: finalPresets, tokens });
     onClose();
   };
 

@@ -7,6 +7,8 @@ import { Menu, MenuItem, PredefinedMenuItem, Submenu } from "@tauri-apps/api/men
 export interface AppCommands {
   newFile: () => void;
   openFolder: () => void;
+  openRemoteWorkspace: () => void;
+  openSshTerminal: () => void;
   save: () => void;
   saveAs: () => void;
   closeActiveTab: () => void;
@@ -56,6 +58,8 @@ export async function installAppMenu(commands: {
     items: [
       await MenuItem.new({ text: "New File", accelerator: "CmdOrCtrl+N", action: run("newFile") }),
       await MenuItem.new({ text: "Open Folder…", accelerator: "CmdOrCtrl+Shift+O", action: run("openFolder") }),
+      await MenuItem.new({ text: "Open Remote Folder (SSH)…", action: run("openRemoteWorkspace") }),
+      await MenuItem.new({ text: "Open SSH Terminal", action: run("openSshTerminal") }),
       await PredefinedMenuItem.new({ item: "Separator" }),
       await MenuItem.new({ text: "Save", accelerator: "CmdOrCtrl+S", action: run("save") }),
       await MenuItem.new({ text: "Save As…", accelerator: "CmdOrCtrl+Shift+S", action: run("saveAs") }),
