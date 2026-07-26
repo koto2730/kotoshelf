@@ -973,23 +973,23 @@ fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<()
         // new console window for the child instead of inheriting ours.
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
-        // Prefer Windows Terminal for a nicer tabbed window. If it isn't
-        // installed/reachable, fall back to spawning ssh directly into a
-        // brand-new plain console - NOT via `cmd /c start`, which failed
-        // in testing: cmd.exe re-parses its command-line argument with
-        // its own quoting/operator rules (&&, ;, quotes are all special
-        // to it too), so the ssh remote-command string above - which
-        // legitimately contains all of those - came out corrupted
-        // ("file not found" trying to run a mangled fragment of it).
-        // Spawning ssh directly sidesteps that: Rust's Command passes
-        // args through standard Win32 argv escaping, no shell involved.
-        if Command::new("wt.exe").arg(&bin).args(&ssh_args).spawn().is_err() {
-            Command::new(&bin)
-                .args(&ssh_args)
-                .creation_flags(CREATE_NEW_CONSOLE)
-                .spawn()
-                .map_err(|e| format!("Failed to open a terminal: {e}"))?;
-        }
+        // Not routed through wt.exe: `Command::new("wt.exe").spawn()`
+        // reports success as soon as the (thin, COM-relaying) wt.exe
+        // process itself starts, regardless of whether Windows Terminal
+        // actually manages to launch the given command line in the new
+        // tab - so a failure there (confirmed in testing: the same "file
+        // not found" error persisted across multiple attempted fixes to
+        // a fallback path that, per this, was never actually being
+        // reached) is invisible to us and impossible to fall back from.
+        // Spawning ssh directly - no wt.exe, no cmd.exe - removes that
+        // whole layer of re-parsing/hand-off uncertainty: Rust's Command
+        // passes args through standard Win32 argv escaping directly to
+        // CreateProcess, nothing re-interprets them in between.
+        Command::new(&bin)
+            .args(&ssh_args)
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map_err(|e| format!("Failed to open a terminal: {e}"))?;
         Ok(())
     }
 
