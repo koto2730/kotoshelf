@@ -62,6 +62,8 @@ import {
   type ResolvedTheme,
 } from "./lib/theme";
 import { ThemeDialog } from "./components/ThemeDialog";
+import { RemoteWorkspaceDialog } from "./components/RemoteWorkspaceDialog";
+import { sshReadTree, sshReadFile, sshWriteFile, sshOpenTerminal, type SshProfile } from "./lib/ssh";
 
 /**
  * Phase 1: workspace + file tree + tabs + native menu.
@@ -106,6 +108,10 @@ export default function App() {
   const [apiPresets, setApiPresets] = useState<ApiPreset[]>([]);
   const [sendBusy, setSendBusy] = useState(false);
   const [themeDialogOpen, setThemeDialogOpen] = useState(false);
+  // ---- remote (SSH) workspace (Phase 8) --------------------------------
+  const [workspaceKind, setWorkspaceKind] = useState<"local" | "ssh">("local");
+  const [sshProfile, setSshProfile] = useState<SshProfile | null>(null);
+  const [remoteDialogOpen, setRemoteDialogOpen] = useState(false);
   /** {line, col, len} to select once the target tab's editor is mounted
    * and active - set by a Search-panel result click, consumed by
    * applyPendingJump. A ref (not state) because it must be readable
@@ -202,16 +208,30 @@ export default function App() {
 
   // ---- workspace ----------------------------------------------------
 
-  const refreshTree = useCallback(async (root: string) => {
-    try {
-      setTree(await readTree(root));
-    } catch (e) {
-      setStatus(`Failed to read workspace: ${e}`);
-    }
-  }, []);
+  // `root` is only used for the local branch - an SSH workspace's root is
+  // `sshProfile.remotePath`, tracked separately - but every caller already
+  // has the local path handy, so keeping one signature for both branches
+  // avoids threading a second "which root" argument through every call site.
+  const refreshTree = useCallback(
+    async (root: string) => {
+      try {
+        if (workspaceKind === "ssh" && sshProfile) {
+          const config = await getAppConfig();
+          setTree(await sshReadTree(sshProfile, config.sshCommandPath));
+        } else {
+          setTree(await readTree(root));
+        }
+      } catch (e) {
+        setStatus(`Failed to read workspace: ${e}`);
+      }
+    },
+    [workspaceKind, sshProfile],
+  );
 
   const openWorkspaceAt = useCallback(
     async (path: string) => {
+      setWorkspaceKind("local");
+      setSshProfile(null);
       setWorkspace(path);
       await refreshTree(path);
       setStatus(`Workspace: ${path}`);
@@ -225,6 +245,33 @@ export default function App() {
     await openWorkspaceAt(picked);
   }, [openWorkspaceAt]);
 
+  const openSshWorkspace = useCallback(async (profile: SshProfile) => {
+    setWorkspaceKind("ssh");
+    setSshProfile(profile);
+    setWorkspace(profile.remotePath);
+    try {
+      const config = await getAppConfig();
+      setTree(await sshReadTree(profile, config.sshCommandPath));
+      const target = profile.user ? `${profile.user}@${profile.host}` : profile.host;
+      setStatus(`Workspace (SSH): ${target}:${profile.remotePath}`);
+    } catch (e) {
+      setStatus(`Failed to read remote workspace: ${e}`);
+    }
+  }, []);
+
+  const openSshTerminal = useCallback(async () => {
+    if (!(workspaceKind === "ssh" && sshProfile)) {
+      setStatus("Open a remote (SSH) folder first");
+      return;
+    }
+    try {
+      const config = await getAppConfig();
+      await sshOpenTerminal(sshProfile, config.sshCommandPath);
+    } catch (e) {
+      setStatus(`Failed to open terminal: ${e}`);
+    }
+  }, [workspaceKind, sshProfile]);
+
   // ---- tabs ----------------------------------------------------------
 
   const openFile = useCallback(
@@ -235,14 +282,17 @@ export default function App() {
         return;
       }
       try {
-        const content = await readFile(path);
+        const content =
+          workspaceKind === "ssh" && sshProfile
+            ? await sshReadFile(sshProfile, (await getAppConfig()).sshCommandPath, path)
+            : await readFile(path);
         setTabs((prev) => [...prev, makeFileTab(path, content)]);
         setActiveIndex(tabs.length);
       } catch (e) {
         setStatus(`${e}`);
       }
     },
-    [tabs],
+    [tabs, workspaceKind, sshProfile],
   );
 
   /** Apply pendingJumpRef to the live editor, if the active tab matches
@@ -326,6 +376,39 @@ export default function App() {
       const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
       if (!tab) return null;
       let targetPath = tab.path;
+
+      // SSH workspaces can't use the native save dialog - it only sees
+      // the local filesystem - so a new/renamed remote file is named via
+      // a plain prompt() instead. Editing an already-open remote file
+      // (the common case) never hits this branch's dialog at all.
+      if (workspaceKind === "ssh" && sshProfile) {
+        if (forceDialog || targetPath === null) {
+          const picked = window.prompt(
+            "Save as (path relative to the remote workspace folder):",
+            targetPath ?? tab.name,
+          );
+          if (!picked) return null;
+          targetPath = picked;
+        }
+        try {
+          const config = await getAppConfig();
+          await sshWriteFile(sshProfile, config.sshCommandPath, targetPath, tab.content);
+          setTabs((prev) =>
+            prev.map((t, i) =>
+              i === activeIndex
+                ? { ...t, path: targetPath, name: basename(targetPath!), savedContent: t.content }
+                : t,
+            ),
+          );
+          setStatus(`Saved ${basename(targetPath)} (SSH)`);
+          void refreshTree(workspace ?? "");
+          return targetPath;
+        } catch (e) {
+          setStatus(`${e}`);
+          return null;
+        }
+      }
+
       if (forceDialog || targetPath === null) {
         const picked = await saveDialog({
           defaultPath: workspace ? `${workspace}/${tab.name}` : tab.name,
@@ -359,7 +442,7 @@ export default function App() {
         return null;
       }
     },
-    [activeIndex, tabs, workspace, refreshTree],
+    [activeIndex, tabs, workspace, workspaceKind, sshProfile, refreshTree],
   );
 
   const closeTab = useCallback(
@@ -754,6 +837,8 @@ export default function App() {
   commandsRef.current = {
     newFile,
     openFolder: () => void openFolder(),
+    openRemoteWorkspace: () => setRemoteDialogOpen(true),
+    openSshTerminal: () => void openSshTerminal(),
     save: () => void saveActive(),
     saveAs: () => void saveActive(true),
     closeActiveTab: () => closeTab(activeIndex),
@@ -1038,6 +1123,15 @@ export default function App() {
           selection={themeSelection}
           onSelect={(name) => void applyThemeSelection(name)}
           onClose={() => setThemeDialogOpen(false)}
+        />
+      )}
+      {remoteDialogOpen && (
+        <RemoteWorkspaceDialog
+          onConnect={(profile) => {
+            setRemoteDialogOpen(false);
+            void openSshWorkspace(profile);
+          }}
+          onClose={() => setRemoteDialogOpen(false)}
         />
       )}
     </div>

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 // ---------------------------------------------------------------------
 // API presets & HTTP send (Phase 6)
@@ -31,16 +32,44 @@ fn default_method() -> String {
     "POST".into()
 }
 
+/// One saved SSH remote-workspace target (Phase 8). `port`/`user`/
+/// `identity_file` are optional so a bare profile can lean entirely on
+/// the user's `~/.ssh/config` (Host alias, default user, IdentityFile)
+/// - we only add `-p`/-`i`/user@ to the ssh invocation when they're set.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SshProfile {
+    name: String,
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    identity_file: Option<String>,
+    remote_path: String,
+}
+
 /// App-wide config (NOT per-workspace): presets and secrets live in
 /// ~/.kotoshelf/config.json rather than inside a workspace, so a token
 /// never ends up accidentally committed if the workspace happens to be a
 /// git repo.
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AppConfig {
     #[serde(default)]
     presets: Vec<ApiPreset>,
     #[serde(default)]
     tokens: HashMap<String, String>,
+    #[serde(default)]
+    ssh_profiles: Vec<SshProfile>,
+    /// Path/name of the ssh executable to invoke. Empty means "ssh"
+    /// resolved from PATH - overridable because a system can have more
+    /// than one ssh.exe (Windows' bundled OpenSSH vs. Git for Windows'
+    /// own build, say) and Tauri's process PATH may not resolve the one
+    /// the user actually wants.
+    #[serde(default)]
+    ssh_command_path: String,
 }
 
 impl Default for AppConfig {
@@ -48,6 +77,8 @@ impl Default for AppConfig {
         AppConfig {
             presets: Vec::new(),
             tokens: HashMap::new(),
+            ssh_profiles: Vec::new(),
+            ssh_command_path: String::new(),
         }
     }
 }
@@ -546,6 +577,463 @@ fn replace_in_files(
     Ok(results)
 }
 
+// ---------------------------------------------------------------------
+// Remote workspaces over SSH (Phase 8)
+// ---------------------------------------------------------------------
+//
+// Deliberately shells out to the system `ssh` binary rather than
+// embedding an SSH library: it reuses whatever the user already has
+// configured in ~/.ssh/config (Host aliases, keys, ProxyJump, agent
+// forwarding) instead of reimplementing auth/host-key handling. The
+// tradeoff is one process spawn per file op, which is fine for an
+// editor (occasional reads/writes) but would be too slow for e.g. a
+// live file-watcher.
+
+/// Directories skipped when walking a remote workspace, mirroring the
+/// local SKIP_DIRS list (kept separate so the two lists can diverge if a
+/// remote-only exclusion is ever needed).
+const SSH_SKIP_DIRS: &[&str] = &[".git", ".kotoshelf", "node_modules", "target"];
+
+/// Wraps `s` in single quotes for a POSIX remote shell, escaping any
+/// embedded single quotes via the standard `'\''` trick (close the
+/// quoted string, emit an escaped quote, reopen).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn ssh_target(profile: &SshProfile) -> String {
+    match &profile.user {
+        Some(u) if !u.is_empty() => format!("{u}@{}", profile.host),
+        _ => profile.host.clone(),
+    }
+}
+
+/// A stable path (per host/port/user) for this connection's ControlMaster
+/// socket, computed ourselves rather than left to ssh's `%C` token - a
+/// token we can't reverse, so we couldn't delete a stale/corrupted socket
+/// file if we don't know its name. Repeated ssh invocations to the same
+/// host reuse one already-authenticated connection instead of paying a
+/// fresh handshake every time; without this, every tree refresh / file
+/// open / save is a brand-new TCP+auth round trip - the dominant cost
+/// that makes the editor feel a beat behind something like VS Code
+/// Remote-SSH, which keeps one connection open throughout.
+/// `None` (home dir unavailable) just means we skip multiplexing for
+/// this call - a slower connection, not a broken one.
+fn ssh_control_path(profile: &SshProfile) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let dir = dirs::home_dir()?.join(".kotoshelf").join("ssh-sockets");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    profile.host.hash(&mut hasher);
+    profile.port.hash(&mut hasher);
+    profile.user.hash(&mut hasher);
+    Some(dir.join(format!("{:x}", hasher.finish())))
+}
+
+/// The `-o ...`/`-p`/`-i` flags shared by every ssh invocation - shaped
+/// as a flat arg list (rather than a `Command`) so both a spawned
+/// `Command` (`ssh_base_command`) and an argument list embedded inside a
+/// *different* spawned program (`ssh_open_terminal`, which hands these
+/// off to wt.exe/Terminal.app/etc.) can reuse the exact same options.
+/// `multiplex = false` builds a plain, single-use connection - used as
+/// the fallback when a multiplexed attempt fails, in case the failure
+/// was a stale ControlMaster socket (e.g. left behind after the remote
+/// host was rebooted mid-session) rather than a real connection problem.
+fn ssh_common_args(profile: &SshProfile, multiplex: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+    ];
+    if multiplex {
+        if let Some(control_path) = ssh_control_path(profile) {
+            args.push("-o".into());
+            args.push("ControlMaster=auto".into());
+            args.push("-o".into());
+            args.push(format!("ControlPath={}", control_path.to_string_lossy()));
+            args.push("-o".into());
+            args.push("ControlPersist=600".into());
+        }
+    }
+    if let Some(port) = profile.port {
+        args.push("-p".into());
+        args.push(port.to_string());
+    }
+    if let Some(idf) = &profile.identity_file {
+        if !idf.is_empty() {
+            args.push("-i".into());
+            args.push(idf.clone());
+        }
+    }
+    args
+}
+
+/// Builds the `ssh` invocation shared by every remote command:
+/// non-interactive (fails fast instead of hanging on a password/host-key
+/// prompt we have no UI for), a short connect timeout, auto-trusting
+/// *new* host keys while still refusing a *changed* one (so first
+/// connection to a fresh host doesn't require a terminal prompt, but a
+/// potential MITM against an already-known host still gets blocked), and
+/// (when `multiplex`) connection reuse so only the first call per host
+/// pays the full handshake cost.
+fn ssh_base_command(ssh_command_path: &str, profile: &SshProfile, multiplex: bool) -> Command {
+    let bin = if ssh_command_path.trim().is_empty() {
+        "ssh"
+    } else {
+        ssh_command_path
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(ssh_common_args(profile, multiplex));
+    cmd.arg(ssh_target(profile));
+    cmd
+}
+
+fn run_ssh_capture_attempt(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    remote_script: &str,
+    multiplex: bool,
+) -> Result<String, String> {
+    let output = ssh_base_command(ssh_command_path, profile, multiplex)
+        .arg(remote_script)
+        .output()
+        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh failed ({}): {}", output.status, stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// On failure, retries once over a fresh, non-multiplexed connection
+/// after clearing this profile's ControlMaster socket - covers a stale
+/// or corrupted socket file (e.g. the remote host rebooted mid-session)
+/// so the app self-heals instead of failing every call until the user
+/// manually deletes `~/.kotoshelf/ssh-sockets/`. If the retry also
+/// fails, that failure (not the first one) is what's reported - it
+/// reflects the actual connection, without multiplexing noise.
+fn run_ssh_capture(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    remote_script: &str,
+) -> Result<String, String> {
+    match run_ssh_capture_attempt(ssh_command_path, profile, remote_script, true) {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            if let Some(path) = ssh_control_path(profile) {
+                let _ = std::fs::remove_file(&path);
+            }
+            run_ssh_capture_attempt(ssh_command_path, profile, remote_script, false)
+        }
+    }
+}
+
+fn run_ssh_with_stdin_attempt(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    remote_script: &str,
+    input: &[u8],
+    multiplex: bool,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = ssh_base_command(ssh_command_path, profile, multiplex)
+        .arg(remote_script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("Failed to open ssh stdin")?
+        .write_all(input)
+        .map_err(|e| format!("Failed to write to ssh stdin: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh failed ({}): {}", output.status, stderr.trim()));
+    }
+    Ok(())
+}
+
+/// Same stale-socket self-healing as `run_ssh_capture` (see its doc
+/// comment) applied to the stdin-piping path used by writes.
+fn run_ssh_with_stdin(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    remote_script: &str,
+    input: &[u8],
+) -> Result<(), String> {
+    match run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, true) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            if let Some(path) = ssh_control_path(profile) {
+                let _ = std::fs::remove_file(&path);
+            }
+            run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, false)
+        }
+    }
+}
+
+/// One entry of the flat "D path" / "F path" listing `ssh_read_tree`'s
+/// remote script prints, folded into a directory tree.
+#[derive(Default)]
+struct SshDirBuilder {
+    children: std::collections::BTreeMap<String, SshEntry>,
+}
+
+enum SshEntry {
+    Dir(SshDirBuilder),
+    File,
+}
+
+/// Inserts one flat entry into the tree being built, creating
+/// intermediate directory nodes on demand - this doesn't depend on
+/// parents being listed before children, since `find`'s traversal order
+/// isn't guaranteed identical across GNU/BSD/busybox implementations.
+fn ssh_insert_path(root: &mut SshDirBuilder, parts: &[&str], is_dir: bool) {
+    let Some((head, rest)) = parts.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        if is_dir {
+            root.children
+                .entry((*head).to_string())
+                .or_insert_with(|| SshEntry::Dir(SshDirBuilder::default()));
+        } else {
+            root.children.insert((*head).to_string(), SshEntry::File);
+        }
+        return;
+    }
+    let entry = root
+        .children
+        .entry((*head).to_string())
+        .or_insert_with(|| SshEntry::Dir(SshDirBuilder::default()));
+    if let SshEntry::Dir(sub) = entry {
+        ssh_insert_path(sub, rest, is_dir);
+    }
+    // else: a file was listed as an ancestor of another path - malformed
+    // remote output, ignore rather than panic.
+}
+
+fn ssh_tree_nodes(dir: &SshDirBuilder, prefix: &str) -> Vec<TreeNode> {
+    let mut nodes: Vec<TreeNode> = dir
+        .children
+        .iter()
+        .map(|(name, entry)| {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry {
+                SshEntry::Dir(sub) => TreeNode {
+                    name: name.clone(),
+                    children: Some(ssh_tree_nodes(sub, &path)),
+                    path,
+                    is_dir: true,
+                },
+                SshEntry::File => TreeNode {
+                    name: name.clone(),
+                    path,
+                    is_dir: false,
+                    children: None,
+                },
+            }
+        })
+        .collect();
+    nodes.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    nodes
+}
+
+fn parse_ssh_tree(raw: &str) -> Vec<TreeNode> {
+    let mut root = SshDirBuilder::default();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.len() < 3 {
+            continue; // shorter than "D x"
+        }
+        let (marker, rest) = line.split_at(1);
+        let path = rest.trim_start();
+        if path.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        ssh_insert_path(&mut root, &parts, marker == "D");
+    }
+    ssh_tree_nodes(&root, "")
+}
+
+/// Builds the `find`-based prune expression shared by both the
+/// directory and file passes of the remote listing script, e.g.
+/// `-name '.git' -o -name '.kotoshelf' -o ...`.
+fn ssh_prune_expr() -> String {
+    SSH_SKIP_DIRS
+        .iter()
+        .map(|d| format!("-name {}", shell_quote(d)))
+        .collect::<Vec<_>>()
+        .join(" -o ")
+}
+
+#[tauri::command]
+fn ssh_read_tree(profile: SshProfile, ssh_command_path: String) -> Result<Vec<TreeNode>, String> {
+    let prune = ssh_prune_expr();
+    let script = format!(
+        "cd {} && find . -mindepth 1 \\( {prune} \\) -prune -o -type d -print | sed 's|^\\./||; s/^/D /' && find . -mindepth 1 \\( {prune} \\) -prune -o -type f -print | sed 's|^\\./||; s/^/F /'",
+        shell_quote(&profile.remote_path),
+    );
+    let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
+    Ok(parse_ssh_tree(&out))
+}
+
+#[tauri::command]
+fn ssh_read_file(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+) -> Result<String, String> {
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let script = format!("cat -- {}", shell_quote(&full));
+    run_ssh_capture(&ssh_command_path, &profile, &script)
+}
+
+#[tauri::command]
+fn ssh_write_file(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+    content: String,
+) -> Result<(), String> {
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let script = format!("cat > {}", shell_quote(&full));
+    run_ssh_with_stdin(&ssh_command_path, &profile, &script, content.as_bytes())
+}
+
+/// Round-trips `cd <remote_path> && pwd` so "Connect" can surface an
+/// auth/host/path failure immediately instead of only on first file op.
+#[tauri::command]
+fn ssh_test_connection(profile: SshProfile, ssh_command_path: String) -> Result<String, String> {
+    let script = format!("cd {} && pwd", shell_quote(&profile.remote_path));
+    run_ssh_capture(&ssh_command_path, &profile, &script).map(|s| s.trim().to_string())
+}
+
+/// Opens an interactive terminal already `cd`'d into the remote
+/// workspace folder over SSH. Best-effort per platform: Windows Terminal
+/// (falling back to a plain console) is exercised in development; the
+/// macOS/Linux branches follow the same shape but are unverified here.
+///
+/// Deliberately NOT multiplexed (`ssh_common_args(&profile, false)`):
+/// `-t` (pty allocation) combined with `ControlMaster=auto` (becoming
+/// the connection's master) is a known-flaky combination on at least
+/// some Windows ssh builds - it failed with "getsockname failed: Not a
+/// socket" even with no stale socket involved, unlike the plain
+/// output-capturing calls elsewhere, where multiplexing works fine. A
+/// terminal is opened rarely enough that paying a full handshake each
+/// time isn't worth that risk.
+#[tauri::command]
+fn ssh_open_terminal(profile: SshProfile, ssh_command_path: String) -> Result<(), String> {
+    let bin = if ssh_command_path.trim().is_empty() {
+        "ssh".to_string()
+    } else {
+        ssh_command_path.clone()
+    };
+
+    let mut ssh_args: Vec<String> = vec!["-t".into()];
+    ssh_args.extend(ssh_common_args(&profile, false));
+    ssh_args.push(ssh_target(&profile));
+    // Setting $TERM on our own spawned wt.exe/cmd process (below) isn't
+    // reliable: if a Windows Terminal window is already open, wt.exe
+    // hands the new tab off to that *existing* window's process, whose
+    // environment is whatever it was when that window first launched -
+    // our env() never reaches the actual ssh child. Exporting TERM as
+    // part of the remote command itself sidesteps that entirely: it's
+    // set in the remote shell regardless of what the local ssh process's
+    // own environment looked like. Without a real TERM, remote
+    // capability-detecting tools (ls, git, a colored prompt) see
+    // TERM unset/empty and silently skip color output.
+    ssh_args.push(format!(
+        "export TERM=xterm-256color; cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+        shell_quote(&profile.remote_path)
+    ));
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // Windows API constant (winbase.h) - CreateProcess allocates a
+        // new console window for the child instead of inheriting ours.
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+        // Not routed through wt.exe: `Command::new("wt.exe").spawn()`
+        // reports success as soon as the (thin, COM-relaying) wt.exe
+        // process itself starts, regardless of whether Windows Terminal
+        // actually manages to launch the given command line in the new
+        // tab - so a failure there (confirmed in testing: the same "file
+        // not found" error persisted across multiple attempted fixes to
+        // a fallback path that, per this, was never actually being
+        // reached) is invisible to us and impossible to fall back from.
+        // Spawning ssh directly - no wt.exe, no cmd.exe - removes that
+        // whole layer of re-parsing/hand-off uncertainty: Rust's Command
+        // passes args through standard Win32 argv escaping directly to
+        // CreateProcess, nothing re-interprets them in between.
+        Command::new(&bin)
+            .args(&ssh_args)
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map_err(|e| format!("Failed to open a terminal: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let full_cmd = std::iter::once(bin.clone())
+            .chain(ssh_args.iter().cloned())
+            .map(|a| shell_quote(&a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "tell application \"Terminal\" to do script \"{}\"",
+            full_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .map_err(|e| format!("Failed to open Terminal.app: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Try common terminal emulators in order; first one that spawns
+        // successfully wins. No single binary is guaranteed present
+        // across distros the way Terminal.app/wt.exe are on their OSes.
+        let candidates: &[(&str, &[&str])] = &[
+            ("x-terminal-emulator", &["-e"]),
+            ("gnome-terminal", &["--"]),
+            ("konsole", &["-e"]),
+            ("xterm", &["-e"]),
+        ];
+        for (term, prefix_args) in candidates {
+            let mut cmd = Command::new(term);
+            cmd.args(*prefix_args).arg(&bin).args(&ssh_args);
+            if cmd.spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        Err("No supported terminal emulator found (tried x-terminal-emulator, gnome-terminal, konsole, xterm)".into())
+    }
+}
+
 /// What `kotoshelf <arg>` on the command line should do, resolved once at
 /// startup from `std::env::args()`. Relative paths (including `.`) are
 /// resolved against the shell's cwd, not the app's install directory -
@@ -622,7 +1110,12 @@ pub fn run() {
             list_custom_themes,
             read_custom_theme,
             get_selected_theme,
-            set_selected_theme
+            set_selected_theme,
+            ssh_read_tree,
+            ssh_read_file,
+            ssh_write_file,
+            ssh_test_connection,
+            ssh_open_terminal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
