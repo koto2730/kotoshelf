@@ -6,6 +6,7 @@ import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { redo, selectAll, undo } from "@codemirror/commands";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { livePreview } from "./editor/livePreview";
@@ -23,12 +24,17 @@ import {
   copyInto,
   createDir,
   flattenTree,
+  formatBytes,
   getInitialTarget,
+  insertTreeDir,
+  insertTreeFile,
+  LARGE_FILE_WARN_BYTES,
   pickWorkspaceFolder,
   readFile,
   readTree,
   renamePath,
   trashPath,
+  utf8ByteLength,
   writeBase64File,
   writeFile,
   type TreeNode,
@@ -39,11 +45,14 @@ import {
   fileToBase64,
   isImagePath,
   joinPath,
+  mimeTypeOf,
+  sanitizeAttachmentName,
   timestampImageStem,
 } from "./lib/attachments";
 import {
   isDirty,
   makeFileTab,
+  makeImageTab,
   makeUntitledTab,
   basename,
   type Tab,
@@ -63,7 +72,20 @@ import {
 } from "./lib/theme";
 import { ThemeDialog } from "./components/ThemeDialog";
 import { RemoteWorkspaceDialog } from "./components/RemoteWorkspaceDialog";
-import { sshReadTree, sshReadFile, sshWriteFile, sshOpenTerminal, type SshProfile } from "./lib/ssh";
+import {
+  sshReadTree,
+  sshReadFile,
+  sshReadFileBase64,
+  sshWriteFile,
+  sshWriteBase64File,
+  sshUploadFile,
+  sshCreateDir,
+  sshRenamePath,
+  sshTrashPath,
+  sshStatSize,
+  sshOpenTerminal,
+  type SshProfile,
+} from "./lib/ssh";
 
 /**
  * Phase 1: workspace + file tree + tabs + native menu.
@@ -103,6 +125,26 @@ export default function App() {
 
   const editorViewRef = useRef<EditorView | null>(null);
   const [leftPane, setLeftPane] = useState<"files" | "search">("files");
+  // Resizable left sidebar (file tree / search) - long filenames or a
+  // deeply nested tree get cramped at a fixed width, with no way to see
+  // more than a truncated name.
+  const [leftPaneWidth, setLeftPaneWidth] = useState(288); // matches the old fixed w-72
+  const leftPaneResizing = useRef(false);
+  const startLeftPaneResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    leftPaneResizing.current = true;
+    const onMove = (ev: MouseEvent) => {
+      if (!leftPaneResizing.current) return;
+      setLeftPaneWidth(Math.min(600, Math.max(160, ev.clientX)));
+    };
+    const onUp = () => {
+      leftPaneResizing.current = false;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
   const [sendPaletteOpen, setSendPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [apiPresets, setApiPresets] = useState<ApiPreset[]>([]);
@@ -282,17 +324,99 @@ export default function App() {
         return;
       }
       try {
-        const content =
-          workspaceKind === "ssh" && sshProfile
-            ? await sshReadFile(sshProfile, (await getAppConfig()).sshCommandPath, path)
-            : await readFile(path);
+        // An image file used to get read as text - its raw bytes
+        // reinterpreted as UTF-8 into a CodeMirror buffer, i.e. visible
+        // mojibake. Route it to a read-only image tab instead.
+        if (isImagePath(path)) {
+          let imageSrc: string;
+          if (workspaceKind === "ssh" && sshProfile) {
+            const sshCommandPath = (await getAppConfig()).sshCommandPath;
+            const cached = flattenTree(tree).find((n) => n.path === path);
+            const size = cached ? cached.size : await sshStatSize(sshProfile, sshCommandPath, path);
+            if (size > LARGE_FILE_WARN_BYTES) {
+              setStatus(
+                `${basename(path)} is ${formatBytes(size)} - too large to open over SSH.`,
+              );
+              return;
+            }
+            const base64 = await sshReadFileBase64(sshProfile, sshCommandPath, path);
+            imageSrc = `data:${mimeTypeOf(path)};base64,${base64}`;
+          } else {
+            imageSrc = convertFileSrc(path);
+          }
+          setTabs((prev) => [...prev, makeImageTab(path, imageSrc)]);
+          setActiveIndex(tabs.length);
+          return;
+        }
+
+        let content: string;
+        if (workspaceKind === "ssh" && sshProfile) {
+          const sshCommandPath = (await getAppConfig()).sshCommandPath;
+          // The tree already carries each file's size from the last
+          // listing/save - reuse it rather than a fresh `wc -c` round
+          // trip. Only fall back to asking the server when the path
+          // isn't in our current snapshot (e.g. changed on the remote
+          // side out from under us).
+          const cached = flattenTree(tree).find((n) => n.path === path);
+          const size = cached ? cached.size : await sshStatSize(sshProfile, sshCommandPath, path);
+          // A hard block, not a confirm-to-proceed dialog: a misclick
+          // among a lot of listed files needing an app restart is worse
+          // than the file simply not opening. The ^ marker in the tree
+          // is the warning; this is what makes it actually stick.
+          if (size > LARGE_FILE_WARN_BYTES) {
+            setStatus(
+              `${basename(path)} is ${formatBytes(size)} - too large to open over SSH.`,
+            );
+            return;
+          }
+          content = await sshReadFile(sshProfile, sshCommandPath, path);
+        } else {
+          content = await readFile(path);
+        }
         setTabs((prev) => [...prev, makeFileTab(path, content)]);
         setActiveIndex(tabs.length);
       } catch (e) {
         setStatus(`${e}`);
       }
     },
-    [tabs, workspaceKind, sshProfile],
+    [tabs, tree, workspaceKind, sshProfile],
+  );
+
+  // Preview images have no local file for <img src="file://..."> to load
+  // in an SSH workspace, so they're fetched as bytes and shown via a
+  // data: URI instead (see components/PreviewPane.tsx). Cached by path
+  // so re-rendering the preview (every keystroke elsewhere in the note)
+  // doesn't re-fetch an image that hasn't changed; a ref rather than
+  // state since it's a cache, not something that should itself trigger
+  // a re-render when it's filled in after the fact.
+  const sshImageCache = useRef<Map<string, string>>(new Map());
+  const resolveSshImage = useCallback(
+    async (relPath: string): Promise<string | null> => {
+      if (!(workspaceKind === "ssh" && sshProfile)) return null;
+      const cached = sshImageCache.current.get(relPath);
+      if (cached) return cached;
+      try {
+        const sshCommandPath = (await getAppConfig()).sshCommandPath;
+        // Same large-file guard as opening a text file: an <img>
+        // reference pointing at something huge shouldn't pull it over
+        // the wire any more than clicking it in the tree should. Fall
+        // back to a live stat when the path isn't in the current tree
+        // snapshot (e.g. added on the remote side since the last
+        // listing) - treating "not found" as size 0 would skip the
+        // guard entirely for exactly the untracked files most likely to
+        // be unexpectedly large.
+        const node = flattenTree(tree).find((n) => n.path === relPath);
+        const size = node ? node.size : await sshStatSize(sshProfile, sshCommandPath, relPath);
+        if (size > LARGE_FILE_WARN_BYTES) return null;
+        const base64 = await sshReadFileBase64(sshProfile, sshCommandPath, relPath);
+        const uri = `data:${mimeTypeOf(relPath)};base64,${base64}`;
+        sshImageCache.current.set(relPath, uri);
+        return uri;
+      } catch {
+        return null;
+      }
+    },
+    [workspaceKind, sshProfile, tree],
   );
 
   /** Apply pendingJumpRef to the live editor, if the active tab matches
@@ -375,7 +499,22 @@ export default function App() {
     async (forceDialog = false): Promise<string | null> => {
       const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
       if (!tab) return null;
+      // An image tab has no text content to write - its content/
+      // savedContent are always "". Without this guard, Ctrl+S while
+      // viewing one would happily overwrite the actual image file with
+      // an empty string.
+      if (tab.kind === "image") return null;
       let targetPath = tab.path;
+      // Whether this save lands at a path not already in the tree (a
+      // brand-new file, or Save As to a different name) - the only case
+      // that actually needs a tree refresh. Skipping it for an ordinary
+      // save-in-place matters most for SSH workspaces: refreshing means
+      // a full remote directory walk over the network on every Ctrl+S,
+      // which is most of why saving felt sluggish compared to editing a
+      // local file (a local refresh is a cheap fs read either way, but
+      // there's no reason to pay even that when nothing structural
+      // changed).
+      const isNewPath = targetPath === null || forceDialog;
 
       // SSH workspaces can't use the native save dialog - it only sees
       // the local filesystem - so a new/renamed remote file is named via
@@ -401,7 +540,12 @@ export default function App() {
             ),
           );
           setStatus(`Saved ${basename(targetPath)} (SSH)`);
-          void refreshTree(workspace ?? "");
+          // No round trip needed either way: a new path can only land
+          // inside a directory the tree already has loaded (there's no
+          // remote mkdir), and an existing path just needs its cached
+          // size refreshed - both are a local splice/update, never a
+          // re-walk of the remote tree over the network.
+          setTree((prev) => insertTreeFile(prev, targetPath!, utf8ByteLength(tab.content)));
           return targetPath;
         } catch (e) {
           setStatus(`${e}`);
@@ -435,7 +579,7 @@ export default function App() {
           ),
         );
         setStatus(`Saved ${basename(targetPath)}`);
-        if (workspace) void refreshTree(workspace);
+        if (workspace && isNewPath) void refreshTree(workspace);
         return targetPath;
       } catch (e) {
         setStatus(`${e}`);
@@ -485,15 +629,25 @@ export default function App() {
           ? (file.type.split("/")[1] ?? "png").replace("jpeg", "jpg")
           : "png";
         const name = `${timestampImageStem()}.${ext}`;
-        await writeBase64File(joinPath(dir, name), await fileToBase64(file));
+        const base64 = await fileToBase64(file);
+        if (workspaceKind === "ssh" && sshProfile) {
+          const sshCommandPath = (await getAppConfig()).sshCommandPath;
+          await sshWriteBase64File(sshProfile, sshCommandPath, joinPath(dir, name), base64);
+        } else {
+          await writeBase64File(joinPath(dir, name), base64);
+        }
         insertAtCursor(`![](${ATTACHMENTS_DIR}/${name})`);
         setStatus(`Attached ${name}`);
+        // Full refresh here (not a local splice): the attachments/
+        // folder may not exist in the current tree snapshot yet if this
+        // is the first paste for this file, so there's no existing
+        // parent node to splice into.
         if (workspace) void refreshTree(workspace);
       } catch (e) {
         setStatus(`${e}`);
       }
     },
-    [insertAtCursor, workspace, refreshTree],
+    [insertAtCursor, workspace, workspaceKind, sshProfile, refreshTree],
   );
 
   const handleImagePaste = useCallback(
@@ -535,14 +689,27 @@ export default function App() {
           continue;
         }
         const destDir = joinPath(dirname(tab.path), ATTACHMENTS_DIR);
-        const name = `${timestampImageStem()}-${basename(p)}`;
-        void copyInto(p, destDir, name)
+        const name = `${timestampImageStem()}-${sanitizeAttachmentName(basename(p))}`;
+        // `p` is a local absolute path either way; in a remote workspace
+        // the destination is across the wire, so it has to be uploaded
+        // rather than copied with the local-filesystem copyInto.
+        const put =
+          workspaceKind === "ssh" && sshProfile
+            ? getAppConfig().then((c) =>
+                sshUploadFile(sshProfile, c.sshCommandPath, p, joinPath(destDir, name)),
+              )
+            : copyInto(p, destDir, name).then(() => undefined);
+        void put
           .then(() => {
             insertAtCursor(`![](${ATTACHMENTS_DIR}/${name})`);
             setStatus(`Attached ${name}`);
             if (workspace) void refreshTree(workspace);
           })
           .catch((e) => setStatus(`${e}`));
+      } else if (workspaceKind === "ssh") {
+        // A dropped path is local; opening it as a tab of a remote
+        // workspace would make every later save target the wrong host.
+        setStatus("Dropped files can't be opened while a remote workspace is open.");
       } else {
         void openFile(p);
       }
@@ -550,15 +717,32 @@ export default function App() {
   };
 
   useEffect(() => {
+    // StrictMode (dev only) runs this effect's setup, then its cleanup,
+    // then setup again, before the async onDragDropEvent registration
+    // below has resolved. If cleanup just discarded a not-yet-arrived
+    // unlisten function, the first listener would leak - never removed,
+    // left running alongside the second setup's listener - so every
+    // drop fired dropRef.current twice (the actual reported bug: one
+    // dropped file inserting its ![]() reference twice). `cancelled`
+    // makes the late-arriving listener unregister itself immediately if
+    // cleanup already ran by the time the promise resolves.
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === "drop") dropRef.current(event.payload.paths);
       })
       .then((fn) => {
-        unlisten = fn;
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       });
-    return () => unlisten?.();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   // ---- wiki links -----------------------------------------------------
@@ -590,12 +774,22 @@ export default function App() {
       // immediately so the link becomes valid the moment it's clicked.
       const fileName = t.endsWith(".md") ? target : `${target}.md`;
       const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
-      const dir = tab?.path ? dirname(tab.path) : workspace;
+      const isSsh = workspaceKind === "ssh" && !!sshProfile;
+      // SSH tab/tree paths are workspace-relative; `workspace` itself
+      // holds the *absolute* remote path (for display), so the no-tab
+      // fallback here must be "" (relative root), not `workspace`.
+      const dir = tab?.path ? dirname(tab.path) : isSsh ? "" : workspace;
       const newPath = joinPath(dir, fileName);
       void (async () => {
         try {
-          await writeFile(newPath, "");
-          await refreshTree(workspace);
+          if (isSsh) {
+            const cmdPath = (await getAppConfig()).sshCommandPath;
+            await sshWriteFile(sshProfile!, cmdPath, newPath, "");
+            setTree((prev) => insertTreeFile(prev, newPath, 0));
+          } else {
+            await writeFile(newPath, "");
+            await refreshTree(workspace);
+          }
           await openFile(newPath);
           setStatus(`Created ${fileName}`);
         } catch (e) {
@@ -603,7 +797,7 @@ export default function App() {
         }
       })();
     },
-    [workspace, tree, openFile, activeIndex, tabs, refreshTree],
+    [workspace, tree, openFile, activeIndex, tabs, refreshTree, workspaceKind, sshProfile],
   );
 
   // Keep the editor-extension callbacks fresh (see interactionsRef).
@@ -611,28 +805,56 @@ export default function App() {
 
   // ---- tree operations (context menu) ---------------------------------
 
-  /** Directory a "new file/folder here" operation should target. */
+  /** Directory a "new file/folder here" operation should target.
+   *
+   * An SSH workspace's tree paths are relative to the remote folder, so
+   * its root is "" - NOT `workspace`, which holds the absolute remote
+   * path for display only. Returning the absolute path there would build
+   * targets like "/Volumes/.../notes.md" and graft a whole "/Volumes/..."
+   * branch onto a tree whose other paths are relative. Returns null only
+   * when there's no workspace at all; "" is a valid target. */
   const menuTargetDir = useCallback(
     (node: TreeNode | null): string | null => {
       if (!workspace) return null;
-      if (!node) return workspace;
+      if (!node) return workspaceKind === "ssh" && sshProfile ? "" : workspace;
       return node.isDir ? node.path : dirname(node.path);
     },
-    [workspace],
+    [workspace, workspaceKind, sshProfile],
   );
 
   const treeMenuActions = useCallback(
     (node: TreeNode | null): MenuAction[] => {
       const dir = menuTargetDir(node);
-      if (!dir || !workspace) return [];
+      // "" is the SSH workspace root - a valid target, so check for null
+      // explicitly rather than falsiness.
+      if (dir === null || !workspace) return [];
+      const isSsh = workspaceKind === "ssh" && !!sshProfile;
+      // basename("") is "", which would render as "New file in /".
+      const dirLabel = basename(dir) || basename(workspace);
       const actions: MenuAction[] = [
         {
           label: "New File…",
           onClick: () =>
             setNamePrompt({
-              title: `New file in ${basename(dir)}/`,
+              title: `New file in ${dirLabel}/`,
               onSubmit: (name) => {
                 const p = joinPath(dir, name);
+                if (isSsh) {
+                  void (async () => {
+                    try {
+                      const cmdPath = (await getAppConfig()).sshCommandPath;
+                      await sshWriteFile(sshProfile!, cmdPath, p, "");
+                      // No round trip needed: we know exactly what was
+                      // created, so splice it in rather than re-walking
+                      // the remote tree.
+                      setTree((prev) => insertTreeFile(prev, p, 0));
+                      await openFile(p);
+                    } catch (e) {
+                      setStatus(`${e}`);
+                    }
+                  })();
+                  return;
+                }
                 void writeFile(p, "")
                   .then(() => refreshTree(workspace))
                   .then(() => openFile(p))
@@ -644,9 +866,22 @@ export default function App() {
           label: "New Folder…",
           onClick: () =>
             setNamePrompt({
-              title: `New folder in ${basename(dir)}/`,
+              title: `New folder in ${dirLabel}/`,
               onSubmit: (name) => {
-                void createDir(joinPath(dir, name))
+                const p = joinPath(dir, name);
+                if (isSsh) {
+                  void (async () => {
+                    try {
+                      const cmdPath = (await getAppConfig()).sshCommandPath;
+                      await sshCreateDir(sshProfile!, cmdPath, p);
+                      setTree((prev) => insertTreeDir(prev, p));
+                    } catch (e) {
+                      setStatus(`${e}`);
+                    }
+                  })();
+                  return;
+                }
+                void createDir(p)
                   .then(() => refreshTree(workspace))
                   .catch((e) => setStatus(`${e}`));
               },
@@ -663,24 +898,44 @@ export default function App() {
                 initial: node.name,
                 onSubmit: (name) => {
                   const to = joinPath(dirname(node.path), name);
+                  const applyRename = () => {
+                    // Follow the rename in any open tabs (files directly,
+                    // and everything under a renamed folder by prefix).
+                    setTabs((prev) =>
+                      prev.map((t) => {
+                        if (!t.path) return t;
+                        if (t.path === node.path) {
+                          return { ...t, path: to, name: basename(to) };
+                        }
+                        if (t.path.startsWith(node.path + "/") ||
+                            t.path.startsWith(node.path + "\\")) {
+                          const suffix = t.path.slice(node.path.length);
+                          return { ...t, path: to + suffix };
+                        }
+                        return t;
+                      }),
+                    );
+                  };
+                  if (isSsh) {
+                    void (async () => {
+                      try {
+                        const cmdPath = (await getAppConfig()).sshCommandPath;
+                        await sshRenamePath(sshProfile!, cmdPath, node.path, to);
+                        applyRename();
+                        // A renamed folder relocates every descendant's
+                        // path, which a local splice doesn't attempt -
+                        // simpler and safer to just re-fetch here, since
+                        // renames are rare compared to plain saves.
+                        await refreshTree(workspace);
+                      } catch (e) {
+                        setStatus(`${e}`);
+                      }
+                    })();
+                    return;
+                  }
                   void renamePath(node.path, to)
                     .then(() => {
-                      // Follow the rename in any open tabs (files directly,
-                      // and everything under a renamed folder by prefix).
-                      setTabs((prev) =>
-                        prev.map((t) => {
-                          if (!t.path) return t;
-                          if (t.path === node.path) {
-                            return { ...t, path: to, name: basename(to) };
-                          }
-                          if (t.path.startsWith(node.path + "/") ||
-                              t.path.startsWith(node.path + "\\")) {
-                            const suffix = t.path.slice(node.path.length);
-                            return { ...t, path: to + suffix };
-                          }
-                          return t;
-                        }),
-                      );
+                      applyRename();
                       return refreshTree(workspace);
                     })
                     .catch((e) => setStatus(`${e}`));
@@ -692,6 +947,19 @@ export default function App() {
             danger: true,
             onClick: () => {
               if (!window.confirm(`Move "${node.name}" to the trash?`)) return;
+              if (isSsh) {
+                void (async () => {
+                  try {
+                    const cmdPath = (await getAppConfig()).sshCommandPath;
+                    await sshTrashPath(sshProfile!, cmdPath, node.path);
+                    setStatus(`Moved ${node.name} to .kotoshelf/.trash`);
+                    await refreshTree(workspace);
+                  } catch (e) {
+                    setStatus(`${e}`);
+                  }
+                })();
+                return;
+              }
               void trashPath(node.path)
                 .then(() => {
                   setStatus(`Moved ${node.name} to trash`);
@@ -706,7 +974,7 @@ export default function App() {
       }
       return actions;
     },
-    [menuTargetDir, workspace, refreshTree, openFile],
+    [menuTargetDir, workspace, workspaceKind, sshProfile, refreshTree, openFile],
   );
 
   // ---- clipboard (menu-driven; keyboard chords are native) -----------
@@ -917,7 +1185,10 @@ export default function App() {
   return (
     <div className="flex h-screen text-slate-900 dark:text-slate-100 bg-white dark:bg-slate-950">
       {/* Left: workspace file tree / search */}
-      <aside className="w-72 shrink-0 border-r border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex flex-col">
+      <aside
+        className="shrink-0 border-r border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 flex flex-col"
+        style={{ width: leftPaneWidth }}
+      >
         {workspace && (
           <div className="flex border-b border-slate-200 dark:border-slate-800">
             <button
@@ -1008,6 +1279,12 @@ export default function App() {
         )}
       </aside>
 
+      {/* Drag to resize the left sidebar. */}
+      <div
+        className="w-1 shrink-0 cursor-col-resize hover:bg-blue-400/50 active:bg-blue-500/50"
+        onMouseDown={startLeftPaneResize}
+      />
+
       {/* Center: tab bar + editor */}
       <main className="flex-1 min-w-0 flex flex-col">
         <TabBar
@@ -1017,7 +1294,15 @@ export default function App() {
           onClose={closeTab}
         />
         <div className="flex-1 min-h-0 overflow-hidden">
-          {activeTab ? (
+          {activeTab?.kind === "image" ? (
+            <div className="h-full flex items-center justify-center overflow-auto bg-slate-100 dark:bg-slate-950 p-4">
+              <img
+                src={activeTab.imageSrc}
+                alt={activeTab.name}
+                className="max-w-full max-h-full object-contain"
+              />
+            </div>
+          ) : activeTab ? (
             <CodeMirror
               // Remount CM per tab so per-file undo history doesn't leak
               // across tabs.
@@ -1058,10 +1343,15 @@ export default function App() {
         <div className="text-xs uppercase tracking-wide text-slate-500 px-3 pt-3">
           Preview
         </div>
-        {isMarkdownTab ? (
+        {activeTab?.kind === "image" ? (
+          <div className="text-sm text-slate-400 italic p-3">
+            {activeTab.name} is an image - shown in the main pane.
+          </div>
+        ) : isMarkdownTab ? (
           <PreviewPane
             content={activeTab?.content ?? ""}
             fileDir={activeTab?.path ? dirname(activeTab.path) : null}
+            resolveSshImage={workspaceKind === "ssh" && sshProfile ? resolveSshImage : undefined}
           />
         ) : (
           <pre className="text-sm whitespace-pre-wrap font-mono text-slate-600 dark:text-slate-400 p-3">
