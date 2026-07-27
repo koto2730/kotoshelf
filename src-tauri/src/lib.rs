@@ -221,6 +221,10 @@ fn set_selected_theme(name: String) -> Result<(), String> {
 /// One node of the workspace file tree. `children` is `Some` for
 /// directories (possibly empty) and `None` for files, so the frontend can
 /// distinguish "empty dir" from "file" without consulting `is_dir` twice.
+/// `size` is 0 for directories - carried alongside the listing (rather
+/// than fetched separately per file) so the frontend can flag large
+/// files without a extra round trip per open, which matters most for
+/// SSH workspaces where "a round trip" means a network hop.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TreeNode {
@@ -228,6 +232,7 @@ struct TreeNode {
     path: String,
     is_dir: bool,
     children: Option<Vec<TreeNode>>,
+    size: u64,
 }
 
 /// Directories that never belong in a notes workspace listing. Keeping
@@ -259,11 +264,17 @@ fn build_tree(dir: &Path, depth: usize) -> Vec<TreeNode> {
         } else {
             None
         };
+        let size = if is_dir {
+            0
+        } else {
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+        };
         nodes.push(TreeNode {
             name,
             path: path.to_string_lossy().into_owned(),
             is_dir,
             children,
+            size,
         });
     }
 
@@ -601,6 +612,37 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Guards every remote path that's supposed to be workspace-relative.
+///
+/// Without this, a caller that mistakenly passes an absolute path still
+/// "works": it gets concatenated onto the remote root, and `mkdir -p`
+/// silently materialises the entire bogus chain (this actually happened -
+/// a New Folder with an absolute target created a
+/// `Volumes/SSD/workspace/...` tree *inside* the workspace, which then
+/// showed up as real entries on the next listing). Failing loudly here
+/// turns that class of bug into an immediate, obvious error instead of
+/// silent filesystem damage, and also stops `..` from escaping the
+/// workspace root.
+fn validate_rel_path(rel: &str) -> Result<(), String> {
+    if rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(format!(
+            "Expected a path relative to the remote workspace, got an absolute path: {rel}"
+        ));
+    }
+    // A Windows-style "C:\..." local path reaching a remote command is
+    // the same category of mistake, and doesn't start with a slash.
+    let first = rel.split(['/', '\\']).next().unwrap_or("");
+    if first.len() == 2 && first.ends_with(':') {
+        return Err(format!(
+            "Expected a path relative to the remote workspace, got a local path: {rel}"
+        ));
+    }
+    if rel.split('/').any(|seg| seg == "..") {
+        return Err(format!("Path escapes the remote workspace: {rel}"));
+    }
+    Ok(())
+}
+
 fn ssh_target(profile: &SshProfile) -> String {
     match &profile.user {
         Some(u) if !u.is_empty() => format!("{u}@{}", profile.host),
@@ -731,6 +773,45 @@ fn run_ssh_capture(
     }
 }
 
+/// Same as run_ssh_capture_attempt but keeps raw bytes rather than
+/// lossily re-encoding through UTF-8 - `run_ssh_capture`'s
+/// `String::from_utf8_lossy` would corrupt binary content (an image's
+/// bytes), replacing anything not valid UTF-8 with U+FFFD.
+fn run_ssh_capture_bytes_attempt(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    remote_script: &str,
+    multiplex: bool,
+) -> Result<Vec<u8>, String> {
+    let output = ssh_base_command(ssh_command_path, profile, multiplex)
+        .arg(remote_script)
+        .output()
+        .map_err(|e| format!("Failed to run ssh: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ssh failed ({}): {}", output.status, stderr.trim()));
+    }
+    Ok(output.stdout)
+}
+
+/// Binary-safe counterpart to run_ssh_capture, with the same stale-socket
+/// self-healing retry.
+fn run_ssh_capture_bytes(
+    ssh_command_path: &str,
+    profile: &SshProfile,
+    remote_script: &str,
+) -> Result<Vec<u8>, String> {
+    match run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, true) {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            if let Some(path) = ssh_control_path(profile) {
+                let _ = std::fs::remove_file(&path);
+            }
+            run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, false)
+        }
+    }
+}
+
 fn run_ssh_with_stdin_attempt(
     ssh_command_path: &str,
     profile: &SshProfile,
@@ -781,8 +862,8 @@ fn run_ssh_with_stdin(
     }
 }
 
-/// One entry of the flat "D path" / "F path" listing `ssh_read_tree`'s
-/// remote script prints, folded into a directory tree.
+/// One entry of the flat "D\t0\tpath" / "F\tsize\tpath" listing
+/// `ssh_read_tree`'s remote script prints, folded into a directory tree.
 #[derive(Default)]
 struct SshDirBuilder {
     children: std::collections::BTreeMap<String, SshEntry>,
@@ -790,14 +871,14 @@ struct SshDirBuilder {
 
 enum SshEntry {
     Dir(SshDirBuilder),
-    File,
+    File { size: u64 },
 }
 
 /// Inserts one flat entry into the tree being built, creating
 /// intermediate directory nodes on demand - this doesn't depend on
 /// parents being listed before children, since `find`'s traversal order
 /// isn't guaranteed identical across GNU/BSD/busybox implementations.
-fn ssh_insert_path(root: &mut SshDirBuilder, parts: &[&str], is_dir: bool) {
+fn ssh_insert_path(root: &mut SshDirBuilder, parts: &[&str], is_dir: bool, size: u64) {
     let Some((head, rest)) = parts.split_first() else {
         return;
     };
@@ -807,7 +888,8 @@ fn ssh_insert_path(root: &mut SshDirBuilder, parts: &[&str], is_dir: bool) {
                 .entry((*head).to_string())
                 .or_insert_with(|| SshEntry::Dir(SshDirBuilder::default()));
         } else {
-            root.children.insert((*head).to_string(), SshEntry::File);
+            root.children
+                .insert((*head).to_string(), SshEntry::File { size });
         }
         return;
     }
@@ -816,7 +898,7 @@ fn ssh_insert_path(root: &mut SshDirBuilder, parts: &[&str], is_dir: bool) {
         .entry((*head).to_string())
         .or_insert_with(|| SshEntry::Dir(SshDirBuilder::default()));
     if let SshEntry::Dir(sub) = entry {
-        ssh_insert_path(sub, rest, is_dir);
+        ssh_insert_path(sub, rest, is_dir, size);
     }
     // else: a file was listed as an ancestor of another path - malformed
     // remote output, ignore rather than panic.
@@ -838,12 +920,14 @@ fn ssh_tree_nodes(dir: &SshDirBuilder, prefix: &str) -> Vec<TreeNode> {
                     children: Some(ssh_tree_nodes(sub, &path)),
                     path,
                     is_dir: true,
+                    size: 0,
                 },
-                SshEntry::File => TreeNode {
+                SshEntry::File { size } => TreeNode {
                     name: name.clone(),
                     path,
                     is_dir: false,
                     children: None,
+                    size: *size,
                 },
             }
         })
@@ -856,27 +940,34 @@ fn ssh_tree_nodes(dir: &SshDirBuilder, prefix: &str) -> Vec<TreeNode> {
     nodes
 }
 
+/// Parses tab-separated "D\t0\tpath" / "F\tsize\tpath" lines. Tab (not
+/// space) delimited, and split with an explicit field count, so a
+/// filename containing spaces is never mistaken for a field boundary.
 fn parse_ssh_tree(raw: &str) -> Vec<TreeNode> {
     let mut root = SshDirBuilder::default();
     for line in raw.lines() {
         let line = line.trim_end_matches('\r');
-        if line.len() < 3 {
-            continue; // shorter than "D x"
-        }
-        let (marker, rest) = line.split_at(1);
-        let path = rest.trim_start();
+        let mut fields = line.splitn(3, '\t');
+        let (Some(marker), Some(size_str), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
         if path.is_empty() {
             continue;
         }
+        // BSD/macOS `wc -c` can pad its count with leading whitespace
+        // (GNU coreutils doesn't) - trim before parsing so the field
+        // isn't silently read as 0 on those hosts.
+        let size = size_str.trim().parse::<u64>().unwrap_or(0);
         let parts: Vec<&str> = path.split('/').collect();
-        ssh_insert_path(&mut root, &parts, marker == "D");
+        ssh_insert_path(&mut root, &parts, marker == "D", size);
     }
     ssh_tree_nodes(&root, "")
 }
 
-/// Builds the `find`-based prune expression shared by both the
-/// directory and file passes of the remote listing script, e.g.
-/// `-name '.git' -o -name '.kotoshelf' -o ...`.
+/// Builds the `find`-based prune expression used to skip SSH_SKIP_DIRS
+/// while walking the remote tree, e.g. `-name '.git' -o -name '.kotoshelf' -o ...`.
 fn ssh_prune_expr() -> String {
     SSH_SKIP_DIRS
         .iter()
@@ -885,13 +976,48 @@ fn ssh_prune_expr() -> String {
         .join(" -o ")
 }
 
+/// One `find` pass over the whole tree (dirs and files together, via the
+/// standard `-prune -o -print` idiom), then a per-entry shell loop that
+/// tags each as D(irectory) or F(ile) and - for files - sizes it from
+/// filesystem metadata: `stat -c%s` (GNU) falling back to `stat -f%z`
+/// (BSD/macOS), whichever the remote's `stat` understands. Deliberately
+/// NOT `wc -c`: that counts bytes by actually reading the whole file,
+/// so sizing a multi-GB video this way means downloading the entire
+/// thing just to answer "how big is this?" - which hung real workspaces
+/// containing large files, defeating the exact large-file check this
+/// size is used for. `stat` reads size from the inode, so it's instant
+/// regardless of file size.
+///
+/// Built via string pushes rather than `format!`, since the shell syntax
+/// here (`${...}`, `$(...)`) is all brace-heavy and would otherwise have
+/// to fight Rust's own `{}` escaping at every turn.
+fn ssh_read_tree_script(remote_path: &str) -> String {
+    let prune = ssh_prune_expr();
+    let mut s = String::new();
+    s.push_str("cd ");
+    s.push_str(&shell_quote(remote_path));
+    s.push_str(" && find . -mindepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o -print | while IFS= read -r p; do ");
+    s.push_str("rel=${p#./}; ");
+    s.push_str("if [ -d \"$p\" ]; then printf 'D\\t0\\t%s\\n' \"$rel\"; ");
+    // If BOTH stat dialects fail, report u64::MAX rather than 0. This
+    // is a safety threshold, not just a display number: failing toward
+    // "treat as unknown/huge" means an unstat-able entry still gets
+    // blocked from opening; failing toward "assume 0 bytes" (what this
+    // used to do) silently cached a wrong tiny size and let a genuinely
+    // huge file open uninterrupted - the exact freeze this size exists
+    // to prevent.
+    s.push_str(
+        "else printf 'F\\t%s\\t%s\\n' \"$(stat -c%s \"$p\" 2>/dev/null || stat -f%z \"$p\" 2>/dev/null || echo 18446744073709551615)\" \"$rel\"; fi; ",
+    );
+    s.push_str("done");
+    s
+}
+
 #[tauri::command]
 fn ssh_read_tree(profile: SshProfile, ssh_command_path: String) -> Result<Vec<TreeNode>, String> {
-    let prune = ssh_prune_expr();
-    let script = format!(
-        "cd {} && find . -mindepth 1 \\( {prune} \\) -prune -o -type d -print | sed 's|^\\./||; s/^/D /' && find . -mindepth 1 \\( {prune} \\) -prune -o -type f -print | sed 's|^\\./||; s/^/F /'",
-        shell_quote(&profile.remote_path),
-    );
+    let script = ssh_read_tree_script(&profile.remote_path);
     let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
     Ok(parse_ssh_tree(&out))
 }
@@ -902,9 +1028,54 @@ fn ssh_read_file(
     ssh_command_path: String,
     rel_path: String,
 ) -> Result<String, String> {
+    validate_rel_path(&rel_path)?;
     let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
     let script = format!("cat -- {}", shell_quote(&full));
     run_ssh_capture(&ssh_command_path, &profile, &script)
+}
+
+/// Binary-safe read for preview images: `ssh_read_file` decodes stdout
+/// as UTF-8 (lossy), which corrupts arbitrary image bytes. Returns
+/// base64 rather than raw bytes since that's what crosses the Tauri IPC
+/// boundary cleanly (mirrors ssh_write_base64_file's direction). The
+/// caller is expected to size-check first (e.g. against the tree's
+/// cached size) - this command doesn't refuse a large file itself.
+#[tauri::command]
+fn ssh_read_file_base64(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+) -> Result<String, String> {
+    validate_rel_path(&rel_path)?;
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let script = format!("cat -- {}", shell_quote(&full));
+    let bytes = run_ssh_capture_bytes(&ssh_command_path, &profile, &script)?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Byte size of a remote file, checked before `ssh_read_file` so the
+/// frontend can warn/refuse before pulling a multi-GB video (say) over
+/// the wire into a text editor buffer. Reads size from filesystem
+/// metadata (`stat -c%s`, falling back to BSD/macOS's `stat -f%z`) -
+/// NOT `wc -c`, which was tried here first and is wrong for this job:
+/// it counts bytes by reading the whole file, so "how big is this
+/// file" ends up reading the entire multi-GB file to find out, which
+/// hung on exactly the large files this check exists to catch.
+#[tauri::command]
+fn ssh_stat_size(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+) -> Result<u64, String> {
+    validate_rel_path(&rel_path)?;
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let full_q = shell_quote(&full);
+    let script = format!("stat -c%s {full_q} 2>/dev/null || stat -f%z {full_q} 2>/dev/null");
+    let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
+    out.trim()
+        .parse::<u64>()
+        .map_err(|e| format!("Could not parse remote file size ({e}): {out:?}"))
 }
 
 #[tauri::command]
@@ -914,9 +1085,135 @@ fn ssh_write_file(
     rel_path: String,
     content: String,
 ) -> Result<(), String> {
+    validate_rel_path(&rel_path)?;
     let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
     let script = format!("cat > {}", shell_quote(&full));
     run_ssh_with_stdin(&ssh_command_path, &profile, &script, content.as_bytes())
+}
+
+/// Write binary content delivered as base64 (clipboard image paste /
+/// dropped-file attach), mirroring the local write_base64_file. Decoded
+/// locally, then piped over ssh's stdin as raw bytes rather than
+/// base64-in-a-shell-string, which would need extra remote-side
+/// decoding and its own escaping concerns.
+#[tauri::command]
+fn ssh_write_base64_file(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+    contents_base64: String,
+) -> Result<(), String> {
+    validate_rel_path(&rel_path)?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(contents_base64)
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let mut script = String::new();
+    if let Some((parent, _)) = full.rsplit_once('/') {
+        script.push_str("mkdir -p ");
+        script.push_str(&shell_quote(parent));
+        script.push_str(" && ");
+    }
+    script.push_str("cat > ");
+    script.push_str(&shell_quote(&full));
+    run_ssh_with_stdin(&ssh_command_path, &profile, &script, &bytes)
+}
+
+/// Uploads an existing *local* file (e.g. an image dragged in from
+/// Explorer) to `rel_path` inside the remote workspace. The remote
+/// counterpart of copy_into: same "attach a file that already exists on
+/// disk" flow, except the destination is across the wire.
+#[tauri::command]
+fn ssh_upload_file(
+    profile: SshProfile,
+    ssh_command_path: String,
+    local_path: String,
+    rel_path: String,
+) -> Result<(), String> {
+    validate_rel_path(&rel_path)?;
+    let bytes = std::fs::read(&local_path)
+        .map_err(|e| format!("Failed to read {local_path}: {e}"))?;
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let mut script = String::new();
+    if let Some((parent, _)) = full.rsplit_once('/') {
+        script.push_str("mkdir -p ");
+        script.push_str(&shell_quote(parent));
+        script.push_str(" && ");
+    }
+    script.push_str("cat > ");
+    script.push_str(&shell_quote(&full));
+    run_ssh_with_stdin(&ssh_command_path, &profile, &script, &bytes)
+}
+
+#[tauri::command]
+fn ssh_create_dir(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+) -> Result<(), String> {
+    validate_rel_path(&rel_path)?;
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let script = format!("mkdir -p -- {}", shell_quote(&full));
+    run_ssh_capture(&ssh_command_path, &profile, &script).map(|_| ())
+}
+
+#[tauri::command]
+fn ssh_rename_path(
+    profile: SshProfile,
+    ssh_command_path: String,
+    from_rel: String,
+    to_rel: String,
+) -> Result<(), String> {
+    validate_rel_path(&from_rel)?;
+    validate_rel_path(&to_rel)?;
+    let root = profile.remote_path.trim_end_matches('/');
+    let from = format!("{root}/{from_rel}");
+    let to = format!("{root}/{to_rel}");
+    // Guard against clobbering an existing target, matching the local
+    // rename_path's "Already exists" check.
+    let script = format!(
+        "if [ -e {} ]; then echo __EXISTS__; else mv -- {} {}; fi",
+        shell_quote(&to),
+        shell_quote(&from),
+        shell_quote(&to),
+    );
+    let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
+    if out.trim() == "__EXISTS__" {
+        return Err(format!("Already exists: {to_rel}"));
+    }
+    Ok(())
+}
+
+/// Moves a file or directory into `.kotoshelf/.trash/` inside the remote
+/// workspace, timestamped to avoid colliding with a previous delete of
+/// the same name. Remote equivalent of the local trash_path: there's no
+/// OS trash / recycle bin to move into on an arbitrary remote host, but
+/// tree operations should still always be recoverable rather than a
+/// silent permanent delete.
+#[tauri::command]
+fn ssh_trash_path(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+) -> Result<(), String> {
+    validate_rel_path(&rel_path)?;
+    let root = profile.remote_path.trim_end_matches('/');
+    let full = format!("{root}/{rel_path}");
+    let trash_dir = format!("{root}/.kotoshelf/.trash");
+    let name = rel_path.rsplit('/').next().unwrap_or(&rel_path);
+
+    let mut script = String::new();
+    script.push_str("mkdir -p ");
+    script.push_str(&shell_quote(&trash_dir));
+    script.push_str(" && ts=$(date +%s) && mv -- ");
+    script.push_str(&shell_quote(&full));
+    script.push(' ');
+    script.push_str(&shell_quote(&trash_dir));
+    script.push_str("/\"$ts-\"");
+    script.push_str(&shell_quote(name));
+
+    run_ssh_capture(&ssh_command_path, &profile, &script).map(|_| ())
 }
 
 /// Round-trips `cd <remote_path> && pwd` so "Connect" can surface an
@@ -1113,10 +1410,90 @@ pub fn run() {
             set_selected_theme,
             ssh_read_tree,
             ssh_read_file,
+            ssh_read_file_base64,
             ssh_write_file,
+            ssh_write_base64_file,
+            ssh_upload_file,
+            ssh_create_dir,
+            ssh_rename_path,
+            ssh_trash_path,
+            ssh_stat_size,
             ssh_test_connection,
             ssh_open_terminal
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rel_path_accepts_ordinary_workspace_paths() {
+        assert!(validate_rel_path("notes.md").is_ok());
+        assert!(validate_rel_path("sub/dir/notes.md").is_ok());
+        assert!(validate_rel_path("attachments/img-20260101-000000.png").is_ok());
+        // "" is the workspace root itself - a valid target for e.g. a
+        // new file created from the tree's background context menu.
+        assert!(validate_rel_path("").is_ok());
+        // ".." only as a *segment* is an escape; as a substring of a
+        // name it's a legitimate filename.
+        assert!(validate_rel_path("my..notes.md").is_ok());
+    }
+
+    #[test]
+    fn rel_path_rejects_absolute_and_escaping_paths() {
+        // The regression this guard exists for: an absolute path reached
+        // ssh_create_dir, got concatenated onto the remote root, and
+        // `mkdir -p` silently built the whole bogus chain inside the
+        // workspace instead of failing.
+        assert!(validate_rel_path("/Volumes/SSD/workspace/Base/notes").is_err());
+        assert!(validate_rel_path("C:\\Users\\me\\notes.md").is_err());
+        assert!(validate_rel_path("..").is_err());
+        assert!(validate_rel_path("../outside.md").is_err());
+        assert!(validate_rel_path("sub/../../outside.md").is_err());
+    }
+
+    #[test]
+    fn ssh_tree_parses_sizes_and_nests_by_path() {
+        let raw = "F\t12\troot.md\nD\t0\tsub\nF\t34\tsub/nested.md\n";
+        let nodes = parse_ssh_tree(raw);
+        // Directories sort before files.
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "sub");
+        assert!(nodes[0].is_dir);
+        assert_eq!(nodes[1].name, "root.md");
+        assert_eq!(nodes[1].size, 12);
+
+        let children = nodes[0].children.as_ref().expect("dir has children");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].path, "sub/nested.md");
+        assert_eq!(children[0].size, 34);
+    }
+
+    #[test]
+    fn ssh_tree_tolerates_spaces_and_bsd_padded_sizes() {
+        // Tab-delimited with a bounded split, so spaces in a filename
+        // are never read as a field boundary; BSD/macOS `wc -c` pads its
+        // count with leading spaces, which must still parse.
+        let raw = "F\t  56\tmy notes with spaces.md\n";
+        let nodes = parse_ssh_tree(raw);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "my notes with spaces.md");
+        assert_eq!(nodes[0].size, 56);
+    }
+
+    #[test]
+    fn ssh_tree_treats_unstatable_files_as_huge_not_tiny() {
+        // The remote script's fallback when both `stat` dialects fail is
+        // u64::MAX, not 0 - this regression let an unreadable/unusual
+        // file get cached as size 0, which skipped the large-file guard
+        // entirely and opened (attempted to, at least) a multi-GB file
+        // with no warning.
+        let raw = format!("F\t{}\tweird-file\n", u64::MAX);
+        let nodes = parse_ssh_tree(&raw);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].size, u64::MAX);
+    }
 }

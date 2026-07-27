@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { TreeNode } from "../lib/fs";
+import { formatBytes, LARGE_FILE_WARN_BYTES, type TreeNode } from "../lib/fs";
 
 /**
  * Recursive workspace tree. Expansion state lives in a Set of paths at
@@ -82,7 +82,11 @@ function TreeLevel({
               e.stopPropagation();
               onNodeMenu?.(node, e.clientX, e.clientY);
             }}
-            title={node.path}
+            title={
+              !node.isDir && node.size > LARGE_FILE_WARN_BYTES
+                ? `${node.path} - too large to open (${formatBytes(node.size)})`
+                : node.path
+            }
           >
             <span className="mr-1 inline-block w-3 text-slate-400">
               {node.isDir ? (expanded.has(node.path) ? "▾" : "▸") : ""}
@@ -98,6 +102,14 @@ function TreeLevel({
             >
               {node.name}
             </span>
+            {!node.isDir && node.size > LARGE_FILE_WARN_BYTES && (
+              <span
+                className="ml-1 text-amber-500 dark:text-amber-400"
+                title={`Too large to open (${formatBytes(node.size)})`}
+              >
+                ^
+              </span>
+            )}
           </button>
           {node.isDir && expanded.has(node.path) && node.children && (
             <TreeLevel
