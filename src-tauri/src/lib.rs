@@ -88,13 +88,20 @@ fn app_config_path() -> Result<PathBuf, String> {
     Ok(home.join(".kotoshelf").join("config.json"))
 }
 
-#[tauri::command]
-fn get_app_config() -> AppConfig {
+/// Shared by the `get_app_config` command and `resolve_initial_target`
+/// (which runs before the Tauri app - and therefore its command/IPC
+/// system - exists, so it needs a plain function to call directly).
+fn load_app_config() -> AppConfig {
     app_config_path()
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_app_config() -> AppConfig {
+    load_app_config()
 }
 
 #[tauri::command]
@@ -1346,13 +1353,33 @@ enum InitialTarget {
     /// with no tree would be a degraded experience here since the tree
     /// is central to the app, unlike a single-file-focused editor).
     File { path: String, workspace: String },
+    /// Open this saved SSH profile directly - the `kotoshelf --ssh
+    /// <name>` CLI equivalent of picking it in "Open Remote Folder
+    /// (SSH)..." and hitting Connect.
+    SshProfile { profile: SshProfile },
 }
 
 fn resolve_initial_target() -> Option<InitialTarget> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `kotoshelf --ssh <profile-name>` - looked up in the same
+    // ~/.kotoshelf/config.json saved profiles the "Open Remote Folder
+    // (SSH)..." dialog manages, by name. Checked before the generic
+    // positional-arg scan below so `--ssh` itself (which starts with
+    // '-') doesn't fall through to being skipped as "looks like a flag".
+    if let Some(idx) = args.iter().position(|a| a == "--ssh") {
+        let name = args.get(idx + 1)?;
+        let profile = load_app_config()
+            .ssh_profiles
+            .into_iter()
+            .find(|p| &p.name == name)?;
+        return Some(InitialTarget::SshProfile { profile });
+    }
+
     // First positional argument after the executable, skipping anything
     // that looks like a flag - Tauri/webview may inject its own args in
     // dev mode (e.g. --no-sandbox on some platforms).
-    let arg = std::env::args().skip(1).find(|a| !a.starts_with('-'))?;
+    let arg = args.into_iter().find(|a| !a.starts_with('-'))?;
     let cwd = std::env::current_dir().ok()?;
     let resolved = cwd.join(&arg);
     let canonical = resolved.canonicalize().unwrap_or(resolved);

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { SshProfile } from "./ssh";
 
 /** Mirror of the Rust TreeNode struct (serde camelCase). `size` is 0 for
  * directories - carried alongside the listing (rather than fetched
@@ -122,11 +123,12 @@ export function replaceInFiles(
 
 export type InitialTarget =
   | { kind: "workspace"; path: string }
-  | { kind: "file"; path: string; workspace: string };
+  | { kind: "file"; path: string; workspace: string }
+  | { kind: "sshProfile"; profile: SshProfile };
 
-/** `kotoshelf <path>` / `kotoshelf .` from the command line, resolved once
- * at Rust startup. Called on mount; returns null for a plain launch with
- * no usable argument. */
+/** `kotoshelf <path>` / `kotoshelf .` / `kotoshelf --ssh <profile-name>`
+ * from the command line, resolved once at Rust startup. Called on mount;
+ * returns null for a plain launch with no usable argument. */
 export function getInitialTarget(): Promise<InitialTarget | null> {
   return invoke<InitialTarget | null>("get_initial_target");
 }

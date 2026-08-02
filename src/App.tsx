@@ -462,13 +462,16 @@ export default function App() {
     [openFile, applyPendingJump],
   );
 
-  // `kotoshelf .` / `kotoshelf notes.md` on the command line. Runs once on
-  // mount; a plain launch (no usable arg) resolves to null and is a no-op.
+  // `kotoshelf .` / `kotoshelf notes.md` / `kotoshelf --ssh <profile-name>`
+  // on the command line. Runs once on mount; a plain launch (no usable
+  // arg) resolves to null and is a no-op.
   useEffect(() => {
     void getInitialTarget().then((target) => {
       if (!target) return;
       if (target.kind === "workspace") {
         void openWorkspaceAt(target.path);
+      } else if (target.kind === "sshProfile") {
+        void openSshWorkspace(target.profile);
       } else {
         void openWorkspaceAt(target.workspace).then(() => openFile(target.path));
       }
