@@ -19,6 +19,8 @@ export interface AppCommands {
   copy: () => void;
   paste: () => void;
   selectAll: () => void;
+  openFind: () => void;
+  openReplace: () => void;
   zoomIn: () => void;
   zoomOut: () => void;
   zoomReset: () => void;
@@ -84,6 +86,9 @@ export async function installAppMenu(commands: {
       await MenuItem.new({ text: "Paste", action: run("paste") }),
       await PredefinedMenuItem.new({ item: "Separator" }),
       await MenuItem.new({ text: "Select All", accelerator: "CmdOrCtrl+A", action: run("selectAll") }),
+      await PredefinedMenuItem.new({ item: "Separator" }),
+      await MenuItem.new({ text: "Find…", accelerator: "CmdOrCtrl+F", action: run("openFind") }),
+      await MenuItem.new({ text: "Replace…", accelerator: "CmdOrCtrl+H", action: run("openReplace") }),
     ],
   });
 
