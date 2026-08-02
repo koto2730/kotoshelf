@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
-import type { EditorView } from "@codemirror/view";
+import { crosshairCursor, rectangularSelection, type EditorView, type ViewUpdate } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
@@ -20,6 +20,8 @@ import { PreviewPane } from "./components/PreviewPane";
 import { InputModal, ListPickerModal, SaveFirstModal } from "./components/Modals";
 import { ContextMenu, type MenuAction } from "./components/ContextMenu";
 import { SearchPanel, type SearchOpenTarget } from "./components/SearchPanel";
+import { FindReplaceBar } from "./components/FindReplaceBar";
+import { findAllMatches, replaceAllText, initialFindReplaceState, type FindReplaceState } from "./lib/findReplace";
 import {
   copyInto,
   createDir,
@@ -226,8 +228,12 @@ export default function App() {
   };
 
   const editorExtensions = useMemo(() => {
-    if (!isMarkdownTab) return [];
+    // Alt+drag box selection - applies to every buffer, not just
+    // Markdown ones, so it lives outside the isMarkdownTab branch below.
+    const base = [rectangularSelection(), crosshairCursor()];
+    if (!isMarkdownTab) return base;
     return [
+      ...base,
       markdown({
         base: markdownLanguage,
         codeLanguages: languages,
@@ -607,6 +613,144 @@ export default function App() {
       });
     },
     [tabs],
+  );
+
+  // ---- find/replace (current buffer) -----------------------------------
+
+  const [finder, setFinder] = useState<FindReplaceState>(initialFindReplaceState);
+  // CodeMirror's updateListener (wired below via onUpdate) fires for
+  // every selection change unconditionally, including ones this file
+  // itself dispatches (runFind's match-jump) - unlike Compose's
+  // BasicTextField, whose onValueChange only fires for genuine user
+  // interaction (see the parallel comment on EditorState.applyTabValue
+  // in kotomemo, which needs no such marker for exactly that reason).
+  // This ref records "the selection runFind just set", checked by
+  // onUpdate so it can tell that apart from the user actually clicking
+  // or dragging to select something - only the latter should update the
+  // live Find/Replace scope.
+  const lastAutoSelectionRef = useRef<{ from: number; to: number } | null>(null);
+
+  const openFinder = useCallback((mode: "find" | "replace") => {
+    if (activeTab?.kind !== "text") return;
+    const view = editorViewRef.current;
+    const sel = view?.state.selection.main;
+    const scope = sel && !sel.empty ? { from: sel.from, to: sel.to } : null;
+    setFinder((f) => {
+      if (f.visible && f.mode === mode) return initialFindReplaceState;
+      return { ...f, visible: true, mode, scope, lastReplaceCount: -1, wrapped: false, focusTick: f.focusTick + 1 };
+    });
+  }, [activeTab]);
+
+  const closeFinder = useCallback(() => {
+    setFinder(initialFindReplaceState);
+    editorViewRef.current?.focus();
+  }, []);
+
+  const runFind = useCallback(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const fullText = view.state.doc.toString();
+    const from = finder.scope?.from ?? 0;
+    const to = finder.scope?.to ?? fullText.length;
+    const matches = findAllMatches(fullText.slice(from, to), finder.query, finder.regex, finder.caseSensitive).map(
+      (m) => ({ from: m.from + from, to: m.to + from }),
+    );
+    if (matches.length === 0) {
+      setFinder((f) => ({ ...f, lastMatchCount: 0, lastReplaceCount: -1, wrapped: false }));
+      return;
+    }
+    const cursor = view.state.selection.main.head;
+    const effectiveCursor = cursor < from || cursor > to ? from : cursor;
+    const nextAfter = matches.find((m) => m.from >= effectiveCursor);
+    const target = nextAfter ?? matches[0];
+    lastAutoSelectionRef.current = { from: target.from, to: target.to };
+    view.dispatch({ selection: { anchor: target.from, head: target.to }, scrollIntoView: true });
+    setFinder((f) => ({ ...f, lastMatchCount: matches.length, lastReplaceCount: -1, wrapped: nextAfter == null }));
+  }, [finder.scope, finder.query, finder.regex, finder.caseSensitive]);
+
+  const runReplaceOne = useCallback(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const sel = view.state.selection.main;
+    if (sel.empty) {
+      runFind();
+      return;
+    }
+    const fullText = view.state.doc.toString();
+    const selectedText = fullText.slice(sel.from, sel.to);
+    const matchesInSelection = findAllMatches(selectedText, finder.query, finder.regex, finder.caseSensitive);
+    const isFullMatch =
+      matchesInSelection.length === 1 &&
+      matchesInSelection[0].from === 0 &&
+      matchesInSelection[0].to === selectedText.length;
+    if (!isFullMatch) {
+      runFind();
+      return;
+    }
+    const { text: replacementText } = replaceAllText(
+      selectedText,
+      finder.query,
+      finder.replacement,
+      finder.regex,
+      finder.caseSensitive,
+    );
+    view.dispatch({
+      changes: { from: sel.from, to: sel.to, insert: replacementText },
+      selection: { anchor: sel.from + replacementText.length },
+    });
+    setFinder((f) => ({ ...f, lastReplaceCount: 1 }));
+    runFind();
+  }, [finder.query, finder.replacement, finder.regex, finder.caseSensitive, runFind]);
+
+  const runReplaceAll = useCallback(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    const fullText = view.state.doc.toString();
+    const scope = finder.scope;
+    const from = scope?.from ?? 0;
+    const to = scope?.to ?? fullText.length;
+    const { text: replaced, count } = replaceAllText(
+      fullText.slice(from, to),
+      finder.query,
+      finder.replacement,
+      finder.regex,
+      finder.caseSensitive,
+    );
+    if (count === 0) {
+      setFinder((f) => ({ ...f, lastReplaceCount: 0 }));
+      return;
+    }
+    view.dispatch({
+      changes: { from, to, insert: replaced },
+      selection: { anchor: from, head: from + replaced.length },
+    });
+    setFinder((f) => ({
+      ...f,
+      lastReplaceCount: count,
+      scope: scope ? { from, to: from + replaced.length } : null,
+    }));
+  }, [finder.scope, finder.query, finder.replacement, finder.regex, finder.caseSensitive]);
+
+  /** Keeps the Find/Replace scope following the live selection while the
+   * bar is open - selecting something new re-scopes to it, deselecting
+   * clears it back to whole-document. Only reacts to a pure selection
+   * change (no doc edit alongside it, matching kotomemo's applyTabValue
+   * guard) and ignores the one selection change this file causes itself
+   * (runFind's match-jump, recognized via lastAutoSelectionRef) so
+   * clicking "Find Next" doesn't collapse the scope down to whichever
+   * match it just landed on. */
+  const handleEditorUpdate = useCallback(
+    (update: ViewUpdate) => {
+      if (!finder.visible || update.docChanged || !update.selectionSet) return;
+      const sel = update.state.selection.main;
+      const auto = lastAutoSelectionRef.current;
+      if (auto && auto.from === sel.from && auto.to === sel.to) {
+        lastAutoSelectionRef.current = null;
+        return;
+      }
+      setFinder((f) => ({ ...f, scope: sel.empty ? null : { from: sel.from, to: sel.to } }));
+    },
+    [finder.visible],
   );
 
   // ---- attachments (paste / drag & drop) -----------------------------
@@ -1126,6 +1270,8 @@ export default function App() {
       const v = editorViewRef.current;
       if (v) selectAll(v);
     },
+    openFind: () => openFinder("find"),
+    openReplace: () => openFinder("replace"),
     zoomIn: () => setZoom((z) => Math.min(z + 10, 300)),
     zoomOut: () => setZoom((z) => Math.max(z - 10, 50)),
     zoomReset: () => setZoom(100),
@@ -1170,6 +1316,12 @@ export default function App() {
       } else if (key === "0") {
         e.preventDefault();
         dedup("zoomReset", c.zoomReset);
+      } else if (key === "f") {
+        e.preventDefault();
+        dedup("openFind", c.openFind);
+      } else if (key === "h") {
+        e.preventDefault();
+        dedup("openReplace", c.openReplace);
       } else if (e.key === ";") {
         e.preventDefault();
         dedup("openSendPalette", c.openSendPalette);
@@ -1293,6 +1445,19 @@ export default function App() {
           onSelect={setActiveIndex}
           onClose={closeTab}
         />
+        {finder.visible && activeTab?.kind === "text" && (
+          <FindReplaceBar
+            finder={finder}
+            onQueryChange={(query) => setFinder((f) => ({ ...f, query }))}
+            onReplacementChange={(replacement) => setFinder((f) => ({ ...f, replacement }))}
+            onRegexChange={(regex) => setFinder((f) => ({ ...f, regex }))}
+            onCaseSensitiveChange={(caseSensitive) => setFinder((f) => ({ ...f, caseSensitive }))}
+            onFindNext={runFind}
+            onReplaceOne={runReplaceOne}
+            onReplaceAll={runReplaceAll}
+            onClose={closeFinder}
+          />
+        )}
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab?.kind === "image" ? (
             <div className="h-full flex items-center justify-center overflow-auto bg-slate-100 dark:bg-slate-950 p-4">
@@ -1313,6 +1478,7 @@ export default function App() {
                 editorViewRef.current = view;
                 applyPendingJump();
               }}
+              onUpdate={handleEditorUpdate}
               extensions={editorExtensions}
               theme={prefersDark ? oneDark : "light"}
               height="100%"
