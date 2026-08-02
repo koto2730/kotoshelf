@@ -147,6 +147,29 @@ export default function App() {
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
   }, []);
+  // Resizable + hideable right preview pane - same rationale as the left
+  // sidebar (a fixed width cramps some content), plus a way to reclaim
+  // the whole window width for editing when the rendered preview isn't
+  // needed.
+  const [previewVisible, setPreviewVisible] = useState(true);
+  const [previewPaneWidth, setPreviewPaneWidth] = useState(384); // matches the old fixed w-96
+  const previewPaneResizing = useRef(false);
+  const startPreviewPaneResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    previewPaneResizing.current = true;
+    const onMove = (ev: MouseEvent) => {
+      if (!previewPaneResizing.current) return;
+      // Measured from the right edge, since this pane is anchored there.
+      setPreviewPaneWidth(Math.min(800, Math.max(240, window.innerWidth - ev.clientX)));
+    };
+    const onUp = () => {
+      previewPaneResizing.current = false;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
   const [sendPaletteOpen, setSendPaletteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [apiPresets, setApiPresets] = useState<ApiPreset[]>([]);
@@ -462,13 +485,16 @@ export default function App() {
     [openFile, applyPendingJump],
   );
 
-  // `kotoshelf .` / `kotoshelf notes.md` on the command line. Runs once on
-  // mount; a plain launch (no usable arg) resolves to null and is a no-op.
+  // `kotoshelf .` / `kotoshelf notes.md` / `kotoshelf --ssh <profile-name>`
+  // on the command line. Runs once on mount; a plain launch (no usable
+  // arg) resolves to null and is a no-op.
   useEffect(() => {
     void getInitialTarget().then((target) => {
       if (!target) return;
       if (target.kind === "workspace") {
         void openWorkspaceAt(target.path);
+      } else if (target.kind === "sshProfile") {
+        void openSshWorkspace(target.profile);
       } else {
         void openWorkspaceAt(target.workspace).then(() => openFile(target.path));
       }
@@ -1275,6 +1301,7 @@ export default function App() {
     zoomIn: () => setZoom((z) => Math.min(z + 10, 300)),
     zoomOut: () => setZoom((z) => Math.max(z - 10, 50)),
     zoomReset: () => setZoom(100),
+    togglePreview: () => setPreviewVisible((v) => !v),
     openSendPalette: () => setSendPaletteOpen(true),
     openSettings: () => setSettingsOpen(true),
     openThemeDialog: () => setThemeDialogOpen(true),
@@ -1322,6 +1349,9 @@ export default function App() {
       } else if (key === "h") {
         e.preventDefault();
         dedup("openReplace", c.openReplace);
+      } else if (key === "v" && e.shiftKey) {
+        e.preventDefault();
+        dedup("togglePreview", c.togglePreview);
       } else if (e.key === ";") {
         e.preventDefault();
         dedup("openSendPalette", c.openSendPalette);
@@ -1503,28 +1533,51 @@ export default function App() {
         </div>
       </main>
 
-      {/* Right: rendered Markdown preview. Relative images + wiki-link
-          resolution still pending (Phase 3). */}
-      <aside className="w-96 shrink-0 border-l border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 overflow-y-auto">
-        <div className="text-xs uppercase tracking-wide text-slate-500 px-3 pt-3">
-          Preview
-        </div>
-        {activeTab?.kind === "image" ? (
-          <div className="text-sm text-slate-400 italic p-3">
-            {activeTab.name} is an image - shown in the main pane.
-          </div>
-        ) : isMarkdownTab ? (
-          <PreviewPane
-            content={activeTab?.content ?? ""}
-            fileDir={activeTab?.path ? dirname(activeTab.path) : null}
-            resolveSshImage={workspaceKind === "ssh" && sshProfile ? resolveSshImage : undefined}
+      {previewVisible && (
+        <>
+          {/* Drag to resize the right preview pane. */}
+          <div
+            className="w-1 shrink-0 cursor-col-resize hover:bg-blue-400/50 active:bg-blue-500/50"
+            onMouseDown={startPreviewPaneResize}
           />
-        ) : (
-          <pre className="text-sm whitespace-pre-wrap font-mono text-slate-600 dark:text-slate-400 p-3">
-            {activeTab?.content ?? ""}
-          </pre>
-        )}
-      </aside>
+
+          {/* Right: rendered Markdown preview. Relative images + wiki-link
+              resolution still pending (Phase 3). */}
+          <aside
+            className="shrink-0 border-l border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 overflow-y-auto"
+            style={{ width: previewPaneWidth }}
+          >
+            <div className="flex items-center justify-between px-3 pt-3">
+              <span className="text-xs uppercase tracking-wide text-slate-500">
+                Preview
+              </span>
+              <button
+                type="button"
+                className="text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                title="Hide preview (Ctrl+Shift+V)"
+                onClick={() => setPreviewVisible(false)}
+              >
+                ✕
+              </button>
+            </div>
+            {activeTab?.kind === "image" ? (
+              <div className="text-sm text-slate-400 italic p-3">
+                {activeTab.name} is an image - shown in the main pane.
+              </div>
+            ) : isMarkdownTab ? (
+              <PreviewPane
+                content={activeTab?.content ?? ""}
+                fileDir={activeTab?.path ? dirname(activeTab.path) : null}
+                resolveSshImage={workspaceKind === "ssh" && sshProfile ? resolveSshImage : undefined}
+              />
+            ) : (
+              <pre className="text-sm whitespace-pre-wrap font-mono text-slate-600 dark:text-slate-400 p-3">
+                {activeTab?.content ?? ""}
+              </pre>
+            )}
+          </aside>
+        </>
+      )}
 
       {pendingImage && (
         <SaveFirstModal
