@@ -250,8 +250,15 @@ const SKIP_DIRS: &[&str] = &[".git", ".kotoshelf", "node_modules", "target"];
 /// (junction/symlink) directory structures.
 const MAX_DEPTH: usize = 24;
 
-fn build_tree(dir: &Path, depth: usize) -> Vec<TreeNode> {
-    if depth >= MAX_DEPTH {
+/// `max_depth` bounds recursion: a directory at `depth >= max_depth` gets
+/// `children: None` instead of being walked, the same `None` a file
+/// already uses - the frontend already treats "directory with no
+/// children" as "not loaded yet" (see `insertTreeDir`), so this reuses
+/// that meaning rather than adding a new field. `read_tree` (unbounded)
+/// and `read_tree_shallow` (`max_depth: 1`, used for the lazy tree pane)
+/// share this one walker.
+fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Vec<TreeNode> {
+    if depth >= max_depth {
         return Vec::new();
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -266,8 +273,8 @@ fn build_tree(dir: &Path, depth: usize) -> Vec<TreeNode> {
         if is_dir && SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
-        let children = if is_dir {
-            Some(build_tree(&path, depth + 1))
+        let children = if is_dir && depth + 1 < max_depth {
+            Some(build_tree(&path, depth + 1, max_depth))
         } else {
             None
         };
@@ -301,7 +308,53 @@ fn read_tree(root: String) -> Result<Vec<TreeNode>, String> {
     if !path.is_dir() {
         return Err(format!("Not a directory: {root}"));
     }
-    Ok(build_tree(path, 0))
+    Ok(build_tree(path, 0, MAX_DEPTH))
+}
+
+/// One level of `dir`'s immediate children - subdirectories come back
+/// with `children: None` ("not loaded yet") rather than being walked, so
+/// the frontend can fetch each folder's contents only when it's actually
+/// expanded instead of recursively statting the whole workspace on every
+/// open/refresh. `dir` is reused for both the workspace root and any
+/// subfolder, since local tree paths are already absolute.
+#[tauri::command]
+fn read_tree_shallow(dir: String) -> Result<Vec<TreeNode>, String> {
+    let path = Path::new(&dir);
+    if !path.is_dir() {
+        return Err(format!("Not a directory: {dir}"));
+    }
+    Ok(build_tree(path, 0, 1))
+}
+
+/// Every file path in the workspace (directories omitted), with no
+/// per-entry size lookup - used by wiki-link resolution, which needs to
+/// match a note by name across the *entire* workspace regardless of
+/// which folders the lazy tree pane has expanded so far.
+fn walk_all_paths(dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if !SKIP_DIRS.contains(&name.as_str()) {
+                walk_all_paths(&path, depth + 1, out);
+            }
+        } else {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+#[tauri::command]
+fn list_all_paths(root: String) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_all_paths(Path::new(&root), 0, &mut out);
+    out
 }
 
 #[tauri::command]
@@ -502,6 +555,50 @@ fn build_regex(query: &str, is_regex: bool, case_sensitive: bool) -> Result<rege
 /// workspace can't produce an unbounded response.
 const MAX_TOTAL_MATCHES: usize = 2000;
 
+/// Regex-scans one file's content for matches, line by line. Shared by
+/// the local and SSH search commands so both walk the exact same match
+/// semantics - column/length in chars (not bytes), 200-char trimmed
+/// preview - rather than risking the two drifting apart.
+fn scan_matches(content: &str, re: &regex::Regex) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+    for (line_no, line) in content.lines().enumerate() {
+        for m in re.find_iter(line) {
+            let col = line[..m.start()].chars().count();
+            let len = line[m.start()..m.end()].chars().count();
+            matches.push(SearchMatch {
+                line: line_no + 1,
+                col,
+                len,
+                preview: line.trim().chars().take(200).collect(),
+            });
+        }
+    }
+    matches
+}
+
+/// Pushes `matches` for `path` onto `results`, applying the running
+/// `MAX_TOTAL_MATCHES` cap. Returns `true` once the cap is hit, so the
+/// caller knows to stop scanning further files.
+fn push_capped(
+    results: &mut Vec<FileSearchResult>,
+    total: &mut usize,
+    path: String,
+    mut matches: Vec<SearchMatch>,
+) -> bool {
+    if matches.is_empty() {
+        return false;
+    }
+    *total += matches.len();
+    let over = total.saturating_sub(MAX_TOTAL_MATCHES);
+    if over > 0 {
+        matches.truncate(matches.len().saturating_sub(over));
+    }
+    if !matches.is_empty() {
+        results.push(FileSearchResult { path, matches });
+    }
+    over > 0
+}
+
 #[tauri::command]
 fn search_workspace(
     root: String,
@@ -522,38 +619,13 @@ fn search_workspace(
 
     let mut results = Vec::new();
     let mut total = 0usize;
-    'files: for path in files {
+    for path in files {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue; // binary or unreadable - skip rather than fail the whole search
         };
-        let mut matches = Vec::new();
-        for (line_no, line) in content.lines().enumerate() {
-            for m in re.find_iter(line) {
-                let col = line[..m.start()].chars().count();
-                let len = line[m.start()..m.end()].chars().count();
-                matches.push(SearchMatch {
-                    line: line_no + 1,
-                    col,
-                    len,
-                    preview: line.trim().chars().take(200).collect(),
-                });
-                total += 1;
-                if total >= MAX_TOTAL_MATCHES {
-                    if !matches.is_empty() {
-                        results.push(FileSearchResult {
-                            path: path.to_string_lossy().into_owned(),
-                            matches,
-                        });
-                    }
-                    break 'files;
-                }
-            }
-        }
-        if !matches.is_empty() {
-            results.push(FileSearchResult {
-                path: path.to_string_lossy().into_owned(),
-                matches,
-            });
+        let matches = scan_matches(&content, &re);
+        if push_capped(&mut results, &mut total, path.to_string_lossy().into_owned(), matches) {
+            break;
         }
     }
     Ok(results)
@@ -564,6 +636,14 @@ fn search_workspace(
 struct ReplaceResult {
     path: String,
     count: usize,
+}
+
+/// Replaces every match of `query` with `replacement` in `content`,
+/// returning the new content and how many matches were replaced. Shared
+/// by the local and SSH replace commands.
+fn apply_replace(content: &str, re: &regex::Regex, replacement: &str) -> (String, usize) {
+    let count = re.find_iter(content).count();
+    (re.replace_all(content, replacement).into_owned(), count)
 }
 
 /// Replace every match of `query` with `replacement` in each of `paths`.
@@ -583,11 +663,10 @@ fn replace_in_files(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let count = re.find_iter(&content).count();
+        let (replaced, count) = apply_replace(&content, &re, &replacement);
         if count == 0 {
             continue;
         }
-        let replaced = re.replace_all(&content, replacement.as_str());
         std::fs::write(&path, replaced.as_bytes())
             .map_err(|e| format!("Failed to write {path}: {e}"))?;
         results.push(ReplaceResult { path, count });
@@ -737,6 +816,20 @@ fn ssh_base_command(ssh_command_path: &str, profile: &SshProfile, multiplex: boo
     let mut cmd = Command::new(bin);
     cmd.args(ssh_common_args(profile, multiplex));
     cmd.arg(ssh_target(profile));
+
+    // Windows only: a GUI app (no console of its own) spawning a console
+    // subprocess otherwise gets a new console window allocated for it,
+    // which briefly flashes on screen - CREATE_NO_WINDOW (winbase.h)
+    // suppresses that. This is every background ssh invocation (tree
+    // listing, read/write, search, ...), NOT ssh_open_terminal, which
+    // wants its console window and sets its own (different) flag.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     cmd
 }
 
@@ -1029,6 +1122,250 @@ fn ssh_read_tree(profile: SshProfile, ssh_command_path: String) -> Result<Vec<Tr
     Ok(parse_ssh_tree(&out))
 }
 
+/// Same "D\t0\tname" / "F\tsize\tname" line format as `ssh_read_tree_script`,
+/// but `-maxdepth 1`, scoped to one directory (`rel_path`, "" for the
+/// workspace root) instead of walking the whole remote tree. This is the
+/// entire point of the lazy tree pane: connecting to a workspace, or
+/// expanding one folder in it, now costs a `find`+`stat` pass over that
+/// one folder's entries, not every file under the workspace root.
+fn ssh_read_tree_shallow_script(remote_path: &str, rel_path: &str) -> String {
+    let dir = if rel_path.is_empty() {
+        remote_path.to_string()
+    } else {
+        format!("{}/{rel_path}", remote_path.trim_end_matches('/'))
+    };
+    let prune = ssh_prune_expr();
+    let mut s = String::new();
+    s.push_str("cd ");
+    s.push_str(&shell_quote(&dir));
+    s.push_str(" && find . -mindepth 1 -maxdepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o -print | while IFS= read -r p; do ");
+    s.push_str("rel=${p#./}; ");
+    s.push_str("if [ -d \"$p\" ]; then printf 'D\\t0\\t%s\\n' \"$rel\"; ");
+    s.push_str(
+        "else printf 'F\\t%s\\t%s\\n' \"$(stat -c%s \"$p\" 2>/dev/null || stat -f%z \"$p\" 2>/dev/null || echo 18446744073709551615)\" \"$rel\"; fi; ",
+    );
+    s.push_str("done");
+    s
+}
+
+/// Parses one level of "D\t0\tname" / "F\tsize\tname" lines (no nested
+/// paths - `ssh_read_tree_shallow_script` only ever lists one directory's
+/// immediate entries). `base` is the already-known relative path of the
+/// directory that was listed ("" for the workspace root), prepended to
+/// each name to produce the workspace-relative paths the rest of the app
+/// expects. Directories always come back with `children: None` - "not
+/// loaded yet", matching `insertTreeDir`'s convention - since this never
+/// looked past one level.
+fn parse_ssh_shallow(raw: &str, base: &str) -> Vec<TreeNode> {
+    let mut nodes = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        let mut fields = line.splitn(3, '\t');
+        let (Some(marker), Some(size_str), Some(name)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let size = size_str.trim().parse::<u64>().unwrap_or(0);
+        let path = if base.is_empty() {
+            name.to_string()
+        } else {
+            format!("{base}/{name}")
+        };
+        nodes.push(TreeNode {
+            name: name.to_string(),
+            path,
+            is_dir: marker == "D",
+            children: None,
+            size,
+        });
+    }
+    nodes.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    nodes
+}
+
+#[tauri::command]
+fn ssh_read_tree_shallow(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+) -> Result<Vec<TreeNode>, String> {
+    validate_rel_path(&rel_path)?;
+    let script = ssh_read_tree_shallow_script(&profile.remote_path, &rel_path);
+    let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
+    Ok(parse_ssh_shallow(&out, &rel_path))
+}
+
+/// Every file path in the workspace, `find`-only - no `stat` at all, so
+/// this stays fast even on a workspace where the lazy tree above is
+/// still the right call for the *pane*. Used for wiki-link resolution,
+/// which needs to search the whole workspace by name regardless of which
+/// folders happen to be expanded in the UI.
+fn ssh_list_all_paths_script(remote_path: &str) -> String {
+    let prune = ssh_prune_expr();
+    let mut s = String::new();
+    s.push_str("cd ");
+    s.push_str(&shell_quote(remote_path));
+    s.push_str(" && find . -mindepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o -type f -print");
+    s
+}
+
+#[tauri::command]
+fn ssh_list_all_paths(profile: SshProfile, ssh_command_path: String) -> Result<Vec<String>, String> {
+    let script = ssh_list_all_paths_script(&profile.remote_path);
+    let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim_end_matches('\r').trim_start_matches("./").to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Files over this size are skipped entirely by workspace search rather
+/// than pulled over the wire - a search is about finding text, not a
+/// place a multi-MB (usually binary) file was ever going to usefully
+/// match anyway.
+const SSH_SEARCH_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Streams every under-the-size-guard file's content back in **one** ssh
+/// round trip: `<relpath>\n<byte-len>\n<raw bytes>` repeated per file.
+/// Length-prefixed rather than delimiter-separated, since file content
+/// can contain anything, including newlines and NUL bytes. This is the
+/// whole point of doing SSH search server-side in one shot instead of
+/// one `ssh_read_file` per candidate file, the way a naive port of the
+/// per-file local implementation would have worked.
+fn ssh_search_fetch_script(remote_path: &str, max_bytes: u64) -> String {
+    let prune = ssh_prune_expr();
+    let mut s = String::new();
+    s.push_str("cd ");
+    s.push_str(&shell_quote(remote_path));
+    s.push_str(" && find . -mindepth 1 \\( ");
+    s.push_str(&prune);
+    s.push_str(" \\) -prune -o -type f -print | while IFS= read -r p; do ");
+    s.push_str("rel=${p#./}; ");
+    s.push_str(&format!(
+        "sz=$(stat -c%s \"$p\" 2>/dev/null || stat -f%z \"$p\" 2>/dev/null || echo 9223372036854775807); \
+         if [ \"$sz\" -le {max_bytes} ]; then printf '%s\\n%s\\n' \"$rel\" \"$sz\"; cat -- \"$p\"; fi; "
+    ));
+    s.push_str("done");
+    s
+}
+
+/// Parses `ssh_search_fetch_script`'s `<relpath>\n<byte-len>\n<raw bytes>`
+/// stream into (path, content-bytes) pairs. Stops (rather than erroring)
+/// on a short/malformed trailing chunk, so a script bug or truncated
+/// transfer degrades to "missing the last file" instead of losing every
+/// result parsed so far.
+fn parse_search_fetch(mut bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    loop {
+        let Some(path_end) = bytes.iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let path = String::from_utf8_lossy(&bytes[..path_end]).into_owned();
+        bytes = &bytes[path_end + 1..];
+        let Some(len_end) = bytes.iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let len_str = String::from_utf8_lossy(&bytes[..len_end]);
+        let Ok(len) = len_str.trim().parse::<usize>() else {
+            break;
+        };
+        bytes = &bytes[len_end + 1..];
+        if bytes.len() < len {
+            break;
+        }
+        out.push((path, bytes[..len].to_vec()));
+        bytes = &bytes[len..];
+    }
+    out
+}
+
+#[tauri::command]
+fn ssh_search_workspace(
+    profile: SshProfile,
+    ssh_command_path: String,
+    query: String,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Result<Vec<FileSearchResult>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let re = build_regex(&query, is_regex, case_sensitive)?;
+    let script = ssh_search_fetch_script(&profile.remote_path, SSH_SEARCH_MAX_FILE_BYTES);
+    let bytes = run_ssh_capture_bytes(&ssh_command_path, &profile, &script)?;
+    let files = parse_search_fetch(&bytes);
+
+    let mut results = Vec::new();
+    let mut total = 0usize;
+    for (path, content_bytes) in files {
+        let Ok(content) = String::from_utf8(content_bytes) else {
+            continue; // binary - skip rather than fail the whole search
+        };
+        let matches = scan_matches(&content, &re);
+        if push_capped(&mut results, &mut total, path, matches) {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+/// Mirrors `replace_in_files`, but `paths` is the (typically small) SSH
+/// search result set rather than a whole-workspace scan, so a plain
+/// read-modify-write loop per file - reusing the same single-file
+/// primitives as `ssh_read_file`/`ssh_write_file` - is simple and fast
+/// enough without needing `ssh_search_fetch_script`'s batching.
+#[tauri::command]
+fn ssh_replace_in_files(
+    profile: SshProfile,
+    ssh_command_path: String,
+    paths: Vec<String>,
+    query: String,
+    replacement: String,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Result<Vec<ReplaceResult>, String> {
+    let re = build_regex(&query, is_regex, case_sensitive)?;
+    let mut results = Vec::new();
+    for rel_path in paths {
+        validate_rel_path(&rel_path)?;
+        let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+        let full_q = shell_quote(&full);
+        let Ok(content) =
+            run_ssh_capture(&ssh_command_path, &profile, &format!("cat -- {full_q}"))
+        else {
+            continue;
+        };
+        let (replaced, count) = apply_replace(&content, &re, &replacement);
+        if count == 0 {
+            continue;
+        }
+        run_ssh_with_stdin(
+            &ssh_command_path,
+            &profile,
+            &format!("cat > {full_q}"),
+            replaced.as_bytes(),
+        )?;
+        results.push(ReplaceResult {
+            path: rel_path,
+            count,
+        });
+    }
+    Ok(results)
+}
+
 #[tauri::command]
 fn ssh_read_file(
     profile: SshProfile,
@@ -1083,6 +1420,83 @@ fn ssh_stat_size(
     out.trim()
         .parse::<u64>()
         .map_err(|e| format!("Could not parse remote file size ({e}): {out:?}"))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshReadOutcome {
+    too_large: bool,
+    size: u64,
+    content_base64: Option<String>,
+}
+
+/// Stat-then-read in one remote round trip instead of two: the caller
+/// used to check a cached tree size, and only fall back to a separate
+/// `ssh_stat_size` call (then a separate `ssh_read_file`/
+/// `ssh_read_file_base64`) when that cache missed. Now that the tree pane
+/// is lazy (see `ssh_read_tree_shallow`), cache misses are common - search
+/// results and wiki-link targets routinely point at files in folders the
+/// user hasn't expanded - so folding stat+read into a single ssh
+/// invocation matters more than it used to.
+///
+/// The remote script stats first; over `max_bytes` it prints only a
+/// `TOOLARGE\t<size>` status line, otherwise `OK\n` followed immediately
+/// by the raw file bytes. The status line is deliberately compared
+/// against a fallback sentinel that fits in a *signed* 64-bit shell
+/// integer (`i64::MAX`, not `u64::MAX`) - `[ "$sz" -gt N ]` is evaluated
+/// by the remote shell's arithmetic, which on real-world shells doesn't
+/// reliably represent `u64::MAX` (~1.8e19, past `i64::MAX`'s ~9.2e18);
+/// getting that wrong here would silently defeat the guard in exactly
+/// the "stat failed" case it exists to catch.
+#[tauri::command]
+fn ssh_read_file_guarded(
+    profile: SshProfile,
+    ssh_command_path: String,
+    rel_path: String,
+    max_bytes: u64,
+) -> Result<SshReadOutcome, String> {
+    validate_rel_path(&rel_path)?;
+    let full = format!("{}/{rel_path}", profile.remote_path.trim_end_matches('/'));
+    let full_q = shell_quote(&full);
+    let script = format!(
+        "sz=$(stat -c%s {full_q} 2>/dev/null || stat -f%z {full_q} 2>/dev/null || echo 9223372036854775807); \
+         if [ \"$sz\" -gt {max_bytes} ]; then printf 'TOOLARGE\\t%s\\n' \"$sz\"; else printf 'OK\\n'; cat -- {full_q}; fi"
+    );
+    let bytes = run_ssh_capture_bytes(&ssh_command_path, &profile, &script)?;
+    parse_guarded_response(&bytes)
+}
+
+/// Parses `ssh_read_file_guarded`'s remote script output: a `TOOLARGE\t<size>`
+/// or `OK` status line, followed by `\n` and (for `OK`) the raw file
+/// bytes. Factored out of the command itself so it's testable without an
+/// actual ssh connection.
+fn parse_guarded_response(bytes: &[u8]) -> Result<SshReadOutcome, String> {
+    let nl = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or("Malformed response from remote read (no status line)")?;
+    let status = String::from_utf8_lossy(&bytes[..nl]).into_owned();
+    let body = &bytes[nl + 1..];
+    if let Some(rest) = status.strip_prefix("TOOLARGE\t") {
+        let size = rest
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("Could not parse remote file size ({e}): {rest:?}"))?;
+        return Ok(SshReadOutcome {
+            too_large: true,
+            size,
+            content_base64: None,
+        });
+    }
+    if status.trim() != "OK" {
+        return Err(format!("Unexpected response from remote read: {status:?}"));
+    }
+    use base64::Engine as _;
+    Ok(SshReadOutcome {
+        too_large: false,
+        size: body.len() as u64,
+        content_base64: Some(base64::engine::general_purpose::STANDARD.encode(body)),
+    })
 }
 
 #[tauri::command]
@@ -1416,6 +1830,8 @@ pub fn run() {
         .manage(InitialTargetState(initial_target))
         .invoke_handler(tauri::generate_handler![
             read_tree,
+            read_tree_shallow,
+            list_all_paths,
             read_file,
             write_file,
             write_base64_file,
@@ -1436,8 +1852,11 @@ pub fn run() {
             get_selected_theme,
             set_selected_theme,
             ssh_read_tree,
+            ssh_read_tree_shallow,
+            ssh_list_all_paths,
             ssh_read_file,
             ssh_read_file_base64,
+            ssh_read_file_guarded,
             ssh_write_file,
             ssh_write_base64_file,
             ssh_upload_file,
@@ -1445,6 +1864,8 @@ pub fn run() {
             ssh_rename_path,
             ssh_trash_path,
             ssh_stat_size,
+            ssh_search_workspace,
+            ssh_replace_in_files,
             ssh_test_connection,
             ssh_open_terminal
         ])
@@ -1522,5 +1943,105 @@ mod tests {
         let nodes = parse_ssh_tree(&raw);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].size, u64::MAX);
+    }
+
+    #[test]
+    fn ssh_shallow_marks_dirs_unloaded_not_empty() {
+        // The lazy tree pane's whole safety property depends on this:
+        // a directory just listed at this level must come back with
+        // children: None ("not fetched yet"), never Some(vec![])
+        // ("fetched, genuinely empty") - the latter would make the UI
+        // think an unexpanded folder has already been checked and is
+        // just empty, so it would never re-fetch it on expand.
+        let raw = "F\t12\tnote.md\nD\t0\tsub\n";
+        let nodes = parse_ssh_shallow(raw, "notes");
+        assert_eq!(nodes.len(), 2);
+        let dir = nodes.iter().find(|n| n.is_dir).expect("has a dir entry");
+        assert_eq!(dir.path, "notes/sub");
+        assert!(dir.children.is_none());
+        let file = nodes.iter().find(|n| !n.is_dir).expect("has a file entry");
+        assert_eq!(file.path, "notes/note.md");
+        assert_eq!(file.size, 12);
+    }
+
+    #[test]
+    fn ssh_shallow_at_root_has_no_leading_slash() {
+        let raw = "F\t1\troot.md\n";
+        let nodes = parse_ssh_shallow(raw, "");
+        assert_eq!(nodes[0].path, "root.md");
+    }
+
+    #[test]
+    fn search_fetch_roundtrips_multiple_files_including_binary_bytes() {
+        // Length-prefixed rather than delimiter-separated specifically so
+        // content containing newlines/NUL bytes can't be mistaken for a
+        // frame boundary - this test exercises exactly that.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"a.md\n5\n");
+        raw.extend_from_slice(b"line\n"); // embeds a newline in the "content"
+        raw.extend_from_slice(b"b/c.md\n3\n");
+        raw.extend_from_slice(&[0u8, 1, 2]); // embeds a NUL byte
+        let files = parse_search_fetch(&raw);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "a.md");
+        assert_eq!(files[0].1, b"line\n");
+        assert_eq!(files[1].0, "b/c.md");
+        assert_eq!(files[1].1, vec![0u8, 1, 2]);
+    }
+
+    #[test]
+    fn search_fetch_stops_cleanly_on_truncated_trailing_entry() {
+        let raw = b"a.md\n100\ntoo short".to_vec();
+        let files = parse_search_fetch(&raw);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn scan_matches_reports_char_offsets_not_byte_offsets() {
+        let re = build_regex("wa", false, false).unwrap();
+        let matches = scan_matches("\u{6c17}持ち good", &re);
+        // No match here - just confirms multi-byte content doesn't panic
+        // on the byte-index slicing inside scan_matches.
+        assert!(matches.is_empty());
+
+        let matches = scan_matches("héllo world", &re);
+        assert_eq!(matches.len(), 0);
+        let re2 = build_regex("world", false, false).unwrap();
+        let matches2 = scan_matches("héllo world", &re2);
+        assert_eq!(matches2.len(), 1);
+        // "héllo " is 6 chars even though "é" is 2 bytes in UTF-8 - col
+        // must be a char count, not a byte offset.
+        assert_eq!(matches2[0].col, 6);
+    }
+
+    #[test]
+    fn apply_replace_counts_and_replaces_all_matches() {
+        let re = build_regex("foo", false, false).unwrap();
+        let (replaced, count) = apply_replace("foo bar foo baz", &re, "X");
+        assert_eq!(count, 2);
+        assert_eq!(replaced, "X bar X baz");
+    }
+
+    #[test]
+    fn guarded_response_parses_ok_status_and_body() {
+        let mut bytes = b"OK\n".to_vec();
+        bytes.extend_from_slice(b"hello bytes");
+        let outcome = parse_guarded_response(&bytes).unwrap();
+        assert!(!outcome.too_large);
+        assert_eq!(outcome.size, 11);
+        use base64::Engine as _;
+        assert_eq!(
+            outcome.content_base64.unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(b"hello bytes")
+        );
+    }
+
+    #[test]
+    fn guarded_response_parses_toolarge_status() {
+        let bytes = b"TOOLARGE\t123456\n".to_vec();
+        let outcome = parse_guarded_response(&bytes).unwrap();
+        assert!(outcome.too_large);
+        assert_eq!(outcome.size, 123456);
+        assert!(outcome.content_base64.is_none());
     }
 }
