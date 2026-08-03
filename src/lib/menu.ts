@@ -11,7 +11,9 @@ export interface AppCommands {
   openSshTerminal: () => void;
   save: () => void;
   saveAs: () => void;
+  saveAll: () => void;
   closeActiveTab: () => void;
+  closeAllTabs: () => void;
   exit: () => void;
   undo: () => void;
   redo: () => void;
@@ -66,8 +68,15 @@ export async function installAppMenu(commands: {
       await PredefinedMenuItem.new({ item: "Separator" }),
       await MenuItem.new({ text: "Save", accelerator: "CmdOrCtrl+S", action: run("save") }),
       await MenuItem.new({ text: "Save As…", accelerator: "CmdOrCtrl+Shift+S", action: run("saveAs") }),
+      // VS Code-style two-key chord (Ctrl+K then a second key) - the
+      // native menu accelerator field can only express a single
+      // simultaneous modifier+key combo, not a two-stage sequence, so
+      // these are handled entirely by the webview keydown fallback
+      // (see App.tsx) and just documented in the label here.
+      await MenuItem.new({ text: "Save All (Ctrl+K S)", action: run("saveAll") }),
       await PredefinedMenuItem.new({ item: "Separator" }),
       await MenuItem.new({ text: "Close Tab", accelerator: "CmdOrCtrl+W", action: run("closeActiveTab") }),
+      await MenuItem.new({ text: "Close All Tabs (Ctrl+K Ctrl+W)", action: run("closeAllTabs") }),
       await PredefinedMenuItem.new({ item: "Separator" }),
       await MenuItem.new({ text: "Exit", accelerator: "CmdOrCtrl+Q", action: run("exit") }),
     ],

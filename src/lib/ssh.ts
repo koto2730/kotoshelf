@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { TreeNode } from "./fs";
+import type { FileSearchResult, ReplaceResult, TreeNode } from "./fs";
 
 /** Mirror of the Rust SshProfile struct (serde camelCase). A saved
  * remote-workspace target: `port`/`user`/`identityFile` are optional so a
@@ -27,6 +27,23 @@ export function newSshProfile(name: string): SshProfile {
 
 export function sshReadTree(profile: SshProfile, sshCommandPath: string): Promise<TreeNode[]> {
   return invoke<TreeNode[]>("ssh_read_tree", { profile, sshCommandPath });
+}
+
+/** One level of `relPath`'s immediate children ("" for the workspace
+ * root) - the remote counterpart of `readTreeShallow`. Subdirectories
+ * come back with `children: null` ("not loaded yet"). */
+export function sshReadTreeShallow(
+  profile: SshProfile,
+  sshCommandPath: string,
+  relPath: string,
+): Promise<TreeNode[]> {
+  return invoke<TreeNode[]>("ssh_read_tree_shallow", { profile, sshCommandPath, relPath });
+}
+
+/** Every file path in the workspace, `find`-only (no `stat`) - for
+ * wiki-link resolution, independent of the lazy tree's load state. */
+export function sshListAllPaths(profile: SshProfile, sshCommandPath: string): Promise<string[]> {
+  return invoke<string[]>("ssh_list_all_paths", { profile, sshCommandPath });
 }
 
 export function sshReadFile(
@@ -119,6 +136,72 @@ export function sshStatSize(
   relPath: string,
 ): Promise<number> {
   return invoke<number>("ssh_stat_size", { profile, sshCommandPath, relPath });
+}
+
+export interface SshReadOutcome {
+  tooLarge: boolean;
+  size: number;
+  contentBase64: string | null;
+}
+
+/** Stat-then-read in a single ssh round trip: over `maxBytes` this
+ * resolves with `tooLarge: true` and no content (mirrors the old
+ * sshStatSize-then-refuse flow); otherwise `contentBase64` carries the
+ * file. Replaces the separate sshStatSize + sshReadFile/
+ * sshReadFileBase64 calls for opening a file over SSH. */
+export function sshReadFileGuarded(
+  profile: SshProfile,
+  sshCommandPath: string,
+  relPath: string,
+  maxBytes: number,
+): Promise<SshReadOutcome> {
+  return invoke<SshReadOutcome>("ssh_read_file_guarded", {
+    profile,
+    sshCommandPath,
+    relPath,
+    maxBytes,
+  });
+}
+
+/** Workspace-wide search over SSH, run entirely server-side in one ssh
+ * round trip (the remote script fetches every candidate file's content
+ * in one pass) rather than one round trip per file. */
+export function sshSearchWorkspace(
+  profile: SshProfile,
+  sshCommandPath: string,
+  query: string,
+  isRegex: boolean,
+  caseSensitive: boolean,
+): Promise<FileSearchResult[]> {
+  return invoke<FileSearchResult[]>("ssh_search_workspace", {
+    profile,
+    sshCommandPath,
+    query,
+    isRegex,
+    caseSensitive,
+  });
+}
+
+/** Mirrors replaceInFiles, operating on a remote workspace. `paths` is
+ * expected to be a prior search's (typically small) result set. */
+export function sshReplaceInFiles(
+  profile: SshProfile,
+  sshCommandPath: string,
+  paths: string[],
+  query: string,
+  replacement: string,
+  isRegex: boolean,
+  caseSensitive: boolean,
+): Promise<ReplaceResult[]> {
+  return invoke<ReplaceResult[]>("ssh_replace_in_files", {
+    profile,
+    sshCommandPath,
+    paths,
+    query,
+    replacement,
+    isRegex,
+    caseSensitive,
+  });
 }
 
 /** Round-trips `cd <remotePath> && pwd` - surfaces an auth/host/path

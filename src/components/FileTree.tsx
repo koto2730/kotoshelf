@@ -1,41 +1,37 @@
-import { useState } from "react";
 import { formatBytes, LARGE_FILE_WARN_BYTES, type TreeNode } from "../lib/fs";
 
 /**
- * Recursive workspace tree. Expansion state lives in a Set of paths at
- * the tree root (passed down), so a tree refresh (new node objects)
- * keeps folders expanded.
+ * Recursive workspace tree. Expansion state is controlled by the parent
+ * (App.tsx) rather than owned here, since expanding a folder whose
+ * children haven't been loaded yet (the lazy tree pane) needs to trigger
+ * a fetch - a decision that requires knowing both the node and the
+ * current workspace, neither of which this component has.
  */
 export function FileTree({
   nodes,
+  expanded,
+  onToggle,
   onOpenFile,
   activePath,
   onNodeMenu,
 }: {
   nodes: TreeNode[];
+  expanded: Set<string>;
+  /** Called when a directory row is clicked, before `expanded` is
+   * expected to change - the caller decides whether to fetch children. */
+  onToggle: (node: TreeNode) => void;
   onOpenFile: (path: string) => void;
   activePath: string | null;
   /** Right-click on a tree row. Coordinates are viewport-relative. */
   onNodeMenu?: (node: TreeNode, x: number, y: number) => void;
 }) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-
-  const toggle = (path: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  };
-
   return (
     <div className="text-sm select-none">
       <TreeLevel
         nodes={nodes}
         depth={0}
         expanded={expanded}
-        onToggle={toggle}
+        onToggle={onToggle}
         onOpenFile={onOpenFile}
         activePath={activePath}
         onNodeMenu={onNodeMenu}
@@ -56,7 +52,7 @@ function TreeLevel({
   nodes: TreeNode[];
   depth: number;
   expanded: Set<string>;
-  onToggle: (path: string) => void;
+  onToggle: (node: TreeNode) => void;
   onOpenFile: (path: string) => void;
   activePath: string | null;
   onNodeMenu?: (node: TreeNode, x: number, y: number) => void;
@@ -75,7 +71,7 @@ function TreeLevel({
             }
             style={{ paddingLeft: `${depth * 14 + 4}px` }}
             onClick={() =>
-              node.isDir ? onToggle(node.path) : onOpenFile(node.path)
+              node.isDir ? onToggle(node) : onOpenFile(node.path)
             }
             onContextMenu={(e) => {
               e.preventDefault();
@@ -121,6 +117,14 @@ function TreeLevel({
               activePath={activePath}
               onNodeMenu={onNodeMenu}
             />
+          )}
+          {node.isDir && expanded.has(node.path) && !node.children && (
+            <div
+              className="text-slate-400 italic"
+              style={{ paddingLeft: `${(depth + 1) * 14 + 4}px` }}
+            >
+              Loading…
+            </div>
           )}
         </div>
       ))}

@@ -31,6 +31,23 @@ export function readTree(root: string): Promise<TreeNode[]> {
   return invoke<TreeNode[]>("read_tree", { root });
 }
 
+/** One level of `dir`'s immediate children - subdirectories come back
+ * with `children: undefined` ("not loaded yet") instead of being walked,
+ * so the tree pane can fetch each folder only when it's actually
+ * expanded rather than statting the whole workspace up front. Used for
+ * both the initial workspace root and any on-demand folder expansion. */
+export function readTreeShallow(dir: string): Promise<TreeNode[]> {
+  return invoke<TreeNode[]>("read_tree_shallow", { dir });
+}
+
+/** Every file path in the workspace, with no per-entry size lookup - for
+ * wiki-link resolution, which needs to match a note by name across the
+ * whole workspace regardless of which folders the lazy tree has expanded
+ * so far. */
+export function listAllPaths(root: string): Promise<string[]> {
+  return invoke<string[]>("list_all_paths", { root });
+}
+
 export function readFile(path: string): Promise<string> {
   return invoke<string>("read_file", { path });
 }
@@ -185,8 +202,15 @@ export function insertTreeFile(nodes: TreeNode[], relPath: string, size: number)
     const [head, ...rest] = segments;
     return list.map((n) => {
       if (!n.isDir || n.name !== head) return n;
+      // The lazy tree pane may not have loaded this folder's contents
+      // yet (children still null - it's never been expanded). Splicing
+      // a guessed children array in here would show only the new file
+      // and hide the rest of the folder's real, unknown-to-us contents.
+      // Leave it unloaded; expanding it later fetches the real listing,
+      // which now includes the new file anyway.
+      if (!n.children) return n;
       const newPrefix = prefix ? `${prefix}/${head}` : head;
-      return { ...n, children: insertInto(n.children ?? [], rest, newPrefix) };
+      return { ...n, children: insertInto(n.children, rest, newPrefix) };
     });
   };
 
@@ -213,12 +237,88 @@ export function insertTreeDir(nodes: TreeNode[], relPath: string): TreeNode[] {
     const [head, ...rest] = segments;
     return list.map((n) => {
       if (!n.isDir || n.name !== head) return n;
+      // See the matching comment in insertTreeFile - don't fabricate a
+      // children array for a folder that hasn't been loaded yet.
+      if (!n.children) return n;
       const newPrefix = prefix ? `${prefix}/${head}` : head;
-      return { ...n, children: insertInto(n.children ?? [], rest, newPrefix) };
+      return { ...n, children: insertInto(n.children, rest, newPrefix) };
     });
   };
 
   return insertInto(nodes, parts.slice(0, -1), "");
+}
+
+/** Splices freshly-fetched children into the (already-loaded) directory
+ * node at `dirPath`, transitioning it from `children: undefined`
+ * ("not loaded yet") to the fetched array - the counterpart to
+ * `readTreeShallow`/`sshReadTreeShallow`'s on-demand folder expansion.
+ * `dirPath === ""` means the workspace root itself, whose children are
+ * `nodes` directly rather than a node to find within it.
+ *
+ * Matches by full `path` equality rather than splitting into segments:
+ * SSH tree paths are workspace-relative and always `/`-joined, but local
+ * ones are absolute OS paths (backslash-separated on Windows), so a
+ * segment-based walk like `insertTreeFile`'s can't be reused here - this
+ * needs to work for both. */
+export function insertTreeChildren(
+  nodes: TreeNode[],
+  dirPath: string,
+  children: TreeNode[],
+): TreeNode[] {
+  if (dirPath === "") return sortTreeNodes(children);
+  return nodes.map((n) => {
+    if (n.path === dirPath) return { ...n, children: sortTreeNodes(children) };
+    if (n.children) return { ...n, children: insertTreeChildren(n.children, dirPath, children) };
+    return n;
+  });
+}
+
+/** Removes the node at `path` (file, or directory with its whole
+ * subtree) from an already-loaded tree - used so a delete doesn't need a
+ * round trip to re-list its parent. */
+export function removeTreeNode(nodes: TreeNode[], path: string): TreeNode[] {
+  const removeFrom = (list: TreeNode[]): TreeNode[] =>
+    list
+      .filter((n) => n.path !== path)
+      .map((n) => (n.children ? { ...n, children: removeFrom(n.children) } : n));
+  return removeFrom(nodes);
+}
+
+/** Renames the node at `fromPath` to `toPath` in an already-loaded tree:
+ * updates its own `name`/`path`, and rewrites the `path` prefix of every
+ * already-loaded descendant from `fromPath/...` to `toPath/...`. No
+ * round trip needed even for a folder rename - descendants that haven't
+ * been fetched yet (`children` still `undefined`/`null`) are left alone
+ * and simply get requested under the new path whenever they're expanded,
+ * since the remote rename already relocated them there. */
+export function renameTreeNode(nodes: TreeNode[], fromPath: string, toPath: string): TreeNode[] {
+  const toName = toPath.split("/").filter(Boolean).pop() ?? toPath;
+
+  const rewritePrefix = (list: TreeNode[]): TreeNode[] =>
+    list.map((n) => {
+      if (n.path === fromPath) {
+        return {
+          ...n,
+          name: toName,
+          path: toPath,
+          children: n.children ? rewriteDescendants(n.children, fromPath, toPath) : n.children,
+        };
+      }
+      if (n.children) return { ...n, children: rewritePrefix(n.children) };
+      return n;
+    });
+
+  const rewriteDescendants = (list: TreeNode[], from: string, to: string): TreeNode[] =>
+    list.map((n) => {
+      const path = n.path.startsWith(`${from}/`) ? to + n.path.slice(from.length) : n.path;
+      return {
+        ...n,
+        path,
+        children: n.children ? rewriteDescendants(n.children, from, to) : n.children,
+      };
+    });
+
+  return rewritePrefix(nodes);
 }
 
 /** Byte length of `text` when UTF-8 encoded (JS string .length counts

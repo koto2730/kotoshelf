@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { crosshairCursor, rectangularSelection, type EditorView, type ViewUpdate } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { LanguageDescription } from "@codemirror/language";
+import type { Extension } from "@codemirror/state";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { redo, selectAll, undo } from "@codemirror/commands";
@@ -25,24 +27,33 @@ import { findAllMatches, replaceAllText, initialFindReplaceState, type FindRepla
 import {
   copyInto,
   createDir,
-  flattenTree,
   formatBytes,
   getInitialTarget,
+  insertTreeChildren,
   insertTreeDir,
   insertTreeFile,
   LARGE_FILE_WARN_BYTES,
+  listAllPaths,
   pickWorkspaceFolder,
   readFile,
-  readTree,
+  readTreeShallow,
+  removeTreeNode,
   renamePath,
+  renameTreeNode,
+  replaceInFiles,
+  searchWorkspace,
   trashPath,
   utf8ByteLength,
   writeBase64File,
   writeFile,
+  type FileSearchResult,
+  type ReplaceResult,
   type TreeNode,
 } from "./lib/fs";
 import {
   ATTACHMENTS_DIR,
+  base64ToObjectUrl,
+  base64ToUtf8,
   dirname,
   fileToBase64,
   isImagePath,
@@ -75,16 +86,17 @@ import {
 import { ThemeDialog } from "./components/ThemeDialog";
 import { RemoteWorkspaceDialog } from "./components/RemoteWorkspaceDialog";
 import {
-  sshReadTree,
-  sshReadFile,
-  sshReadFileBase64,
+  sshListAllPaths,
+  sshReadFileGuarded,
+  sshReadTreeShallow,
   sshWriteFile,
   sshWriteBase64File,
   sshUploadFile,
   sshCreateDir,
   sshRenamePath,
   sshTrashPath,
-  sshStatSize,
+  sshSearchWorkspace,
+  sshReplaceInFiles,
   sshOpenTerminal,
   type SshProfile,
 } from "./lib/ssh";
@@ -102,6 +114,15 @@ import {
 export default function App() {
   const [workspace, setWorkspace] = useState<string | null>(null);
   const [tree, setTree] = useState<TreeNode[]>([]);
+  /** Paths currently expanded in the tree pane. Lives here (not inside
+   * FileTree) so expanding a folder whose children aren't loaded yet can
+   * trigger a fetch - the tree is loaded lazily, one level at a time,
+   * rather than the whole workspace walked up front on every connect. */
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Cache of relPath -> blob: object URL for SSH preview images (see
+  // resolveSshImage below). A ref, not state - it's a cache, not
+  // something that should itself trigger a re-render when filled in.
+  const sshImageCache = useRef<Map<string, string>>(new Map());
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [status, setStatus] = useState<string | null>(null);
@@ -226,6 +247,36 @@ export default function App() {
   // highlighting) applies to .md buffers; anything else stays plain.
   const isMarkdownTab = activeTab?.name.toLowerCase().endsWith(".md") ?? false;
 
+  // Non-markdown tabs get syntax highlighting by matching the file name
+  // against @codemirror/language-data's ~200-language table - the same
+  // `languages` list markdown's fenced code blocks already use via
+  // `codeLanguages` below, just matched by the whole file's name instead
+  // of a fence's language tag. Not meant to be authoritative (a
+  // misdetected/unknown extension just falls back to plain text) - only
+  // readable, so an exact-match-by-extension lookup is enough.
+  // LanguageDescription.load() dynamically imports the matched
+  // language's package and caches the result itself, so calling it again
+  // for a language already loaded elsewhere in the app is free.
+  const [fileLangExtension, setFileLangExtension] = useState<Extension | null>(null);
+  useEffect(() => {
+    if (isMarkdownTab || !activeTab?.name) {
+      setFileLangExtension(null);
+      return;
+    }
+    const desc = LanguageDescription.matchFilename(languages, activeTab.name);
+    if (!desc) {
+      setFileLangExtension(null);
+      return;
+    }
+    let cancelled = false;
+    void desc.load().then((support) => {
+      if (!cancelled) setFileLangExtension(support);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isMarkdownTab, activeTab?.name]);
+
   // Callbacks used inside the (memoised) editor extensions go through a
   // ref so the extensions never capture stale state - same pattern as
   // the native-menu commands ref.
@@ -254,7 +305,7 @@ export default function App() {
     // Alt+drag box selection - applies to every buffer, not just
     // Markdown ones, so it lives outside the isMarkdownTab branch below.
     const base = [rectangularSelection(), crosshairCursor()];
-    if (!isMarkdownTab) return base;
+    if (!isMarkdownTab) return fileLangExtension ? [...base, fileLangExtension] : base;
     return [
       ...base,
       markdown({
@@ -275,40 +326,103 @@ export default function App() {
     // re-render Live Preview's colors immediately, same as any other
     // markdown-mode extension change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMarkdownTab, resolvedTheme]);
+  }, [isMarkdownTab, resolvedTheme, fileLangExtension]);
 
   // ---- workspace ----------------------------------------------------
 
-  // `root` is only used for the local branch - an SSH workspace's root is
-  // `sshProfile.remotePath`, tracked separately - but every caller already
-  // has the local path handy, so keeping one signature for both branches
-  // avoids threading a second "which root" argument through every call site.
-  const refreshTree = useCallback(
-    async (root: string) => {
-      try {
-        if (workspaceKind === "ssh" && sshProfile) {
-          const config = await getAppConfig();
-          setTree(await sshReadTree(sshProfile, config.sshCommandPath));
-        } else {
-          setTree(await readTree(root));
-        }
-      } catch (e) {
-        setStatus(`Failed to read workspace: ${e}`);
+  // One level of `dir`'s children, dispatched to the local or SSH
+  // shallow-listing command - the tree pane loads lazily, one folder at
+  // a time, instead of walking the whole workspace (recursively `stat`ing
+  // every file) on every connect/refresh.
+  const loadDirShallow = useCallback(
+    async (dir: string): Promise<TreeNode[]> => {
+      if (workspaceKind === "ssh" && sshProfile) {
+        const config = await getAppConfig();
+        return sshReadTreeShallow(sshProfile, config.sshCommandPath, dir);
       }
+      return readTreeShallow(dir);
     },
     [workspaceKind, sshProfile],
   );
 
-  const openWorkspaceAt = useCallback(
-    async (path: string) => {
-      setWorkspaceKind("local");
-      setSshProfile(null);
-      setWorkspace(path);
-      await refreshTree(path);
-      setStatus(`Workspace: ${path}`);
+  // The workspace root itself: SSH tree paths are relative ("" = root),
+  // but local ones are absolute, so the root isn't just another
+  // `loadDirShallow` call - it needs `workspace` substituted in for the
+  // local branch.
+  const loadRootShallow = useCallback(async (): Promise<TreeNode[]> => {
+    if (workspaceKind === "ssh" && sshProfile) {
+      const config = await getAppConfig();
+      return sshReadTreeShallow(sshProfile, config.sshCommandPath, "");
+    }
+    return workspace ? readTreeShallow(workspace) : [];
+  }, [workspaceKind, sshProfile, workspace]);
+
+  // Expands/collapses a tree row. Expanding a folder whose children
+  // haven't been fetched yet (`children` still null/undefined, the lazy
+  // tree's default) fetches just that one folder - not the rest of the
+  // workspace.
+  const handleToggleDir = useCallback(
+    async (node: TreeNode) => {
+      const wasExpanded = expanded.has(node.path);
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (wasExpanded) next.delete(node.path);
+        else next.add(node.path);
+        return next;
+      });
+      if (wasExpanded || node.children) return;
+      try {
+        const children = await loadDirShallow(node.path);
+        setTree((prev) => insertTreeChildren(prev, node.path, children));
+      } catch (e) {
+        setStatus(`${e}`);
+      }
     },
-    [refreshTree],
+    [expanded, loadDirShallow],
   );
+
+  // Re-fetches the workspace root (one level), then re-fetches whatever
+  // folders are currently expanded so an explicit Refresh updates what's
+  // visible instead of collapsing it back to "not loaded" - without ever
+  // paying for a full recursive re-walk of the whole workspace, which is
+  // exactly what the lazy tree pane exists to avoid.
+  const refreshTree = useCallback(async () => {
+    if (!workspace) return;
+    try {
+      setTree(await loadRootShallow());
+      for (const dirPath of expanded) {
+        try {
+          const children = await loadDirShallow(dirPath);
+          setTree((prev) => insertTreeChildren(prev, dirPath, children));
+        } catch {
+          // Folder likely renamed/removed remotely since - drop it from
+          // the expanded set instead of leaving a dead entry in it.
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            next.delete(dirPath);
+            return next;
+          });
+        }
+      }
+    } catch (e) {
+      setStatus(`Failed to read workspace: ${e}`);
+    }
+  }, [workspace, expanded, loadDirShallow, loadRootShallow]);
+
+  const openWorkspaceAt = useCallback(async (path: string) => {
+    setWorkspaceKind("local");
+    setSshProfile(null);
+    setWorkspace(path);
+    setExpanded(new Set());
+    for (const uri of sshImageCache.current.values()) URL.revokeObjectURL(uri);
+    sshImageCache.current.clear();
+    try {
+      setTree(await readTreeShallow(path));
+      setStatus(`Workspace: ${path}`);
+    } catch (e) {
+      setStatus(`Failed to read workspace: ${e}`);
+    }
+  }, []);
 
   const openFolder = useCallback(async () => {
     const picked = await pickWorkspaceFolder();
@@ -320,9 +434,12 @@ export default function App() {
     setWorkspaceKind("ssh");
     setSshProfile(profile);
     setWorkspace(profile.remotePath);
+    setExpanded(new Set());
+    for (const uri of sshImageCache.current.values()) URL.revokeObjectURL(uri);
+    sshImageCache.current.clear();
     try {
       const config = await getAppConfig();
-      setTree(await sshReadTree(profile, config.sshCommandPath));
+      setTree(await sshReadTreeShallow(profile, config.sshCommandPath, ""));
       const target = profile.user ? `${profile.user}@${profile.host}` : profile.host;
       setStatus(`Workspace (SSH): ${target}:${profile.remotePath}`);
     } catch (e) {
@@ -360,16 +477,23 @@ export default function App() {
           let imageSrc: string;
           if (workspaceKind === "ssh" && sshProfile) {
             const sshCommandPath = (await getAppConfig()).sshCommandPath;
-            const cached = flattenTree(tree).find((n) => n.path === path);
-            const size = cached ? cached.size : await sshStatSize(sshProfile, sshCommandPath, path);
-            if (size > LARGE_FILE_WARN_BYTES) {
+            // One ssh round trip stats-then-reads (or refuses) - the tree
+            // lazily loads folders now, so a path opened via search/wiki
+            // links routinely isn't in the loaded tree at all, unlike
+            // when this only had to cover a rare cache miss.
+            const outcome = await sshReadFileGuarded(
+              sshProfile,
+              sshCommandPath,
+              path,
+              LARGE_FILE_WARN_BYTES,
+            );
+            if (outcome.tooLarge) {
               setStatus(
-                `${basename(path)} is ${formatBytes(size)} - too large to open over SSH.`,
+                `${basename(path)} is ${formatBytes(outcome.size)} - too large to open over SSH.`,
               );
               return;
             }
-            const base64 = await sshReadFileBase64(sshProfile, sshCommandPath, path);
-            imageSrc = `data:${mimeTypeOf(path)};base64,${base64}`;
+            imageSrc = base64ToObjectUrl(outcome.contentBase64!, mimeTypeOf(path));
           } else {
             imageSrc = convertFileSrc(path);
           }
@@ -381,24 +505,23 @@ export default function App() {
         let content: string;
         if (workspaceKind === "ssh" && sshProfile) {
           const sshCommandPath = (await getAppConfig()).sshCommandPath;
-          // The tree already carries each file's size from the last
-          // listing/save - reuse it rather than a fresh `wc -c` round
-          // trip. Only fall back to asking the server when the path
-          // isn't in our current snapshot (e.g. changed on the remote
-          // side out from under us).
-          const cached = flattenTree(tree).find((n) => n.path === path);
-          const size = cached ? cached.size : await sshStatSize(sshProfile, sshCommandPath, path);
+          const outcome = await sshReadFileGuarded(
+            sshProfile,
+            sshCommandPath,
+            path,
+            LARGE_FILE_WARN_BYTES,
+          );
           // A hard block, not a confirm-to-proceed dialog: a misclick
           // among a lot of listed files needing an app restart is worse
           // than the file simply not opening. The ^ marker in the tree
           // is the warning; this is what makes it actually stick.
-          if (size > LARGE_FILE_WARN_BYTES) {
+          if (outcome.tooLarge) {
             setStatus(
-              `${basename(path)} is ${formatBytes(size)} - too large to open over SSH.`,
+              `${basename(path)} is ${formatBytes(outcome.size)} - too large to open over SSH.`,
             );
             return;
           }
-          content = await sshReadFile(sshProfile, sshCommandPath, path);
+          content = base64ToUtf8(outcome.contentBase64!);
         } else {
           content = await readFile(path);
         }
@@ -408,17 +531,16 @@ export default function App() {
         setStatus(`${e}`);
       }
     },
-    [tabs, tree, workspaceKind, sshProfile],
+    [tabs, workspaceKind, sshProfile],
   );
 
   // Preview images have no local file for <img src="file://..."> to load
   // in an SSH workspace, so they're fetched as bytes and shown via a
-  // data: URI instead (see components/PreviewPane.tsx). Cached by path
-  // so re-rendering the preview (every keystroke elsewhere in the note)
-  // doesn't re-fetch an image that hasn't changed; a ref rather than
-  // state since it's a cache, not something that should itself trigger
-  // a re-render when it's filled in after the fact.
-  const sshImageCache = useRef<Map<string, string>>(new Map());
+  // blob: object URL instead (see components/PreviewPane.tsx). Cached by
+  // path so re-rendering the preview (every keystroke elsewhere in the
+  // note) doesn't re-fetch an image that hasn't changed; a ref rather
+  // than state since it's a cache, not something that should itself
+  // trigger a re-render when it's filled in after the fact.
   const resolveSshImage = useCallback(
     async (relPath: string): Promise<string | null> => {
       if (!(workspaceKind === "ssh" && sshProfile)) return null;
@@ -426,26 +548,25 @@ export default function App() {
       if (cached) return cached;
       try {
         const sshCommandPath = (await getAppConfig()).sshCommandPath;
-        // Same large-file guard as opening a text file: an <img>
-        // reference pointing at something huge shouldn't pull it over
-        // the wire any more than clicking it in the tree should. Fall
-        // back to a live stat when the path isn't in the current tree
-        // snapshot (e.g. added on the remote side since the last
-        // listing) - treating "not found" as size 0 would skip the
-        // guard entirely for exactly the untracked files most likely to
-        // be unexpectedly large.
-        const node = flattenTree(tree).find((n) => n.path === relPath);
-        const size = node ? node.size : await sshStatSize(sshProfile, sshCommandPath, relPath);
-        if (size > LARGE_FILE_WARN_BYTES) return null;
-        const base64 = await sshReadFileBase64(sshProfile, sshCommandPath, relPath);
-        const uri = `data:${mimeTypeOf(relPath)};base64,${base64}`;
+        // Same large-file guard as opening a text file, folded into the
+        // same single round trip - the lazy tree pane means the note's
+        // own folder (let alone an image sitting in it) routinely isn't
+        // loaded, so there's no cached size to check here anymore.
+        const outcome = await sshReadFileGuarded(
+          sshProfile,
+          sshCommandPath,
+          relPath,
+          LARGE_FILE_WARN_BYTES,
+        );
+        if (outcome.tooLarge) return null;
+        const uri = base64ToObjectUrl(outcome.contentBase64!, mimeTypeOf(relPath));
         sshImageCache.current.set(relPath, uri);
         return uri;
       } catch {
         return null;
       }
     },
-    [workspaceKind, sshProfile, tree],
+    [workspaceKind, sshProfile],
   );
 
   /** Apply pendingJumpRef to the live editor, if the active tab matches
@@ -527,9 +648,13 @@ export default function App() {
   /** Save the active tab. Returns the saved path, or null when the user
    * cancelled the dialog / nothing to save / write failed - callers like
    * the save-then-attach flow need to know whether to continue. */
-  const saveActive = useCallback(
-    async (forceDialog = false): Promise<string | null> => {
-      const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
+  // Parameterized by index (rather than always reading activeIndex) so
+  // saveAll can drive it across every dirty tab in turn, not just the
+  // active one - saveActive below is just this called with the active
+  // tab's index.
+  const saveTabAt = useCallback(
+    async (index: number, forceDialog = false): Promise<string | null> => {
+      const tab = tabs[index];
       if (!tab) return null;
       // An image tab has no text content to write - its content/
       // savedContent are always "". Without this guard, Ctrl+S while
@@ -566,7 +691,7 @@ export default function App() {
           await sshWriteFile(sshProfile, config.sshCommandPath, targetPath, tab.content);
           setTabs((prev) =>
             prev.map((t, i) =>
-              i === activeIndex
+              i === index
                 ? { ...t, path: targetPath, name: basename(targetPath!), savedContent: t.content }
                 : t,
             ),
@@ -600,7 +725,7 @@ export default function App() {
         await writeFile(targetPath, tab.content);
         setTabs((prev) =>
           prev.map((t, i) =>
-            i === activeIndex
+            i === index
               ? {
                   ...t,
                   path: targetPath,
@@ -611,15 +736,47 @@ export default function App() {
           ),
         );
         setStatus(`Saved ${basename(targetPath)}`);
-        if (workspace && isNewPath) void refreshTree(workspace);
+        if (workspace && isNewPath) void refreshTree();
         return targetPath;
       } catch (e) {
         setStatus(`${e}`);
         return null;
       }
     },
-    [activeIndex, tabs, workspace, workspaceKind, sshProfile, refreshTree],
+    [tabs, workspace, workspaceKind, sshProfile, refreshTree],
   );
+
+  const saveActive = useCallback(
+    (forceDialog = false): Promise<string | null> => saveTabAt(activeIndex, forceDialog),
+    [saveTabAt, activeIndex],
+  );
+
+  const saveAll = useCallback(async () => {
+    const dirtyIndexes = tabs
+      .map((_, i) => i)
+      .filter((i) => tabs[i].kind !== "image" && isDirty(tabs[i]));
+    if (dirtyIndexes.length === 0) {
+      setStatus("Nothing to save");
+      return;
+    }
+    let saved = 0;
+    for (const i of dirtyIndexes) {
+      if ((await saveTabAt(i)) !== null) saved++;
+    }
+    setStatus(`Saved ${saved} of ${dirtyIndexes.length} file(s)`);
+  }, [tabs, saveTabAt]);
+
+  const closeAllTabs = useCallback(() => {
+    const dirtyCount = tabs.filter((t) => isDirty(t)).length;
+    if (dirtyCount > 0) {
+      const ok = window.confirm(
+        `${dirtyCount} file(s) have unsaved changes. Close all tabs anyway?`,
+      );
+      if (!ok) return;
+    }
+    setTabs([]);
+    setActiveIndex(-1);
+  }, [tabs]);
 
   const closeTab = useCallback(
     (index: number) => {
@@ -631,6 +788,10 @@ export default function App() {
         );
         if (!ok) return;
       }
+      // Image tabs opened over SSH hold a blob: object URL (see
+      // base64ToObjectUrl) rather than a data: URI - that binary data
+      // lives outside JS-managed memory until explicitly released.
+      if (tab.imageSrc?.startsWith("blob:")) URL.revokeObjectURL(tab.imageSrc);
       setTabs((prev) => prev.filter((_, i) => i !== index));
       setActiveIndex((prev) => {
         if (index < prev) return prev - 1;
@@ -808,11 +969,15 @@ export default function App() {
         }
         insertAtCursor(`![](${ATTACHMENTS_DIR}/${name})`);
         setStatus(`Attached ${name}`);
-        // Full refresh here (not a local splice): the attachments/
-        // folder may not exist in the current tree snapshot yet if this
-        // is the first paste for this file, so there's no existing
-        // parent node to splice into.
-        if (workspace) void refreshTree(workspace);
+        // Not a local splice: the attachments/ folder may not exist in
+        // the current tree snapshot yet if this is the first paste for
+        // this file, so there's no existing parent node to splice into.
+        // refreshTree only re-fetches the root plus whatever's already
+        // expanded, so this only surfaces the new folder in the tree
+        // pane if its parent happens to be expanded - the attachment
+        // itself is written either way, this is purely a tree-display
+        // nicety.
+        if (workspace) void refreshTree();
       } catch (e) {
         setStatus(`${e}`);
       }
@@ -873,7 +1038,7 @@ export default function App() {
           .then(() => {
             insertAtCursor(`![](${ATTACHMENTS_DIR}/${name})`);
             setStatus(`Attached ${name}`);
-            if (workspace) void refreshTree(workspace);
+            if (workspace) void refreshTree();
           })
           .catch((e) => setStatus(`${e}`));
       } else if (workspaceKind === "ssh") {
@@ -918,25 +1083,37 @@ export default function App() {
   // ---- wiki links -----------------------------------------------------
 
   const resolveWikiLink = useCallback(
-    (target: string) => {
+    async (target: string) => {
       if (!workspace) {
         setStatus("Open a workspace to resolve wiki links.");
         return;
       }
       const t = target.toLowerCase();
-      const matches = flattenTree(tree).filter(
-        (n) =>
-          !n.isDir &&
-          (n.name.toLowerCase() === `${t}.md` || n.name.toLowerCase() === t),
-      );
+      // Matches by name across the *whole* workspace via a dedicated
+      // name-only listing (no `stat`, no size) rather than the tree
+      // pane's state - the tree loads lazily now, one folder at a time,
+      // so a note several unexpanded folders deep wouldn't be found in
+      // it and would look like it doesn't exist yet.
+      let allPaths: string[];
+      try {
+        allPaths =
+          workspaceKind === "ssh" && sshProfile
+            ? await sshListAllPaths(sshProfile, (await getAppConfig()).sshCommandPath)
+            : await listAllPaths(workspace);
+      } catch (e) {
+        setStatus(`${e}`);
+        return;
+      }
+      const matches = allPaths.filter((p) => {
+        const name = basename(p).toLowerCase();
+        return name === `${t}.md` || name === t;
+      });
       if (matches.length === 1) {
-        void openFile(matches[0].path);
+        void openFile(matches[0]);
         return;
       }
       if (matches.length > 1) {
-        setWikiChoices(
-          matches.map((m) => ({ label: m.name, detail: m.path, value: m.path })),
-        );
+        setWikiChoices(matches.map((p) => ({ label: basename(p), detail: p, value: p })));
         return;
       }
       // No match: create the note, Obsidian-style. It lands next to the
@@ -950,28 +1127,68 @@ export default function App() {
       // fallback here must be "" (relative root), not `workspace`.
       const dir = tab?.path ? dirname(tab.path) : isSsh ? "" : workspace;
       const newPath = joinPath(dir, fileName);
-      void (async () => {
-        try {
-          if (isSsh) {
-            const cmdPath = (await getAppConfig()).sshCommandPath;
-            await sshWriteFile(sshProfile!, cmdPath, newPath, "");
-            setTree((prev) => insertTreeFile(prev, newPath, 0));
-          } else {
-            await writeFile(newPath, "");
-            await refreshTree(workspace);
-          }
-          await openFile(newPath);
-          setStatus(`Created ${fileName}`);
-        } catch (e) {
-          setStatus(`${e}`);
+      try {
+        if (isSsh) {
+          const cmdPath = (await getAppConfig()).sshCommandPath;
+          await sshWriteFile(sshProfile!, cmdPath, newPath, "");
+          setTree((prev) => insertTreeFile(prev, newPath, 0));
+        } else {
+          await writeFile(newPath, "");
+          await refreshTree();
         }
-      })();
+        await openFile(newPath);
+        setStatus(`Created ${fileName}`);
+      } catch (e) {
+        setStatus(`${e}`);
+      }
     },
-    [workspace, tree, openFile, activeIndex, tabs, refreshTree, workspaceKind, sshProfile],
+    [workspace, openFile, activeIndex, tabs, refreshTree, workspaceKind, sshProfile],
   );
 
   // Keep the editor-extension callbacks fresh (see interactionsRef).
   interactionsRef.current = { wiki: resolveWikiLink, imagePaste: handleImagePaste };
+
+  // ---- workspace-wide search/replace -----------------------------------
+
+  // Dispatched to Rust either way (search_workspace/ssh_search_workspace),
+  // so a few thousand notes never round-trip full file contents through
+  // IPC just to grep them - SearchPanel itself doesn't need to know which
+  // kind of workspace it's searching.
+  const handleSearch = useCallback(
+    async (query: string, isRegex: boolean, caseSensitive: boolean): Promise<FileSearchResult[]> => {
+      if (workspaceKind === "ssh" && sshProfile) {
+        const cmdPath = (await getAppConfig()).sshCommandPath;
+        return sshSearchWorkspace(sshProfile, cmdPath, query, isRegex, caseSensitive);
+      }
+      return searchWorkspace(workspace ?? "", query, isRegex, caseSensitive);
+    },
+    [workspaceKind, sshProfile, workspace],
+  );
+
+  const handleReplace = useCallback(
+    async (
+      paths: string[],
+      query: string,
+      replacement: string,
+      isRegex: boolean,
+      caseSensitive: boolean,
+    ): Promise<ReplaceResult[]> => {
+      if (workspaceKind === "ssh" && sshProfile) {
+        const cmdPath = (await getAppConfig()).sshCommandPath;
+        return sshReplaceInFiles(
+          sshProfile,
+          cmdPath,
+          paths,
+          query,
+          replacement,
+          isRegex,
+          caseSensitive,
+        );
+      }
+      return replaceInFiles(paths, query, replacement, isRegex, caseSensitive);
+    },
+    [workspaceKind, sshProfile],
+  );
 
   // ---- tree operations (context menu) ---------------------------------
 
@@ -1026,7 +1243,7 @@ export default function App() {
                   return;
                 }
                 void writeFile(p, "")
-                  .then(() => refreshTree(workspace))
+                  .then(() => refreshTree())
                   .then(() => openFile(p))
                   .catch((e) => setStatus(`${e}`));
               },
@@ -1052,7 +1269,7 @@ export default function App() {
                   return;
                 }
                 void createDir(p)
-                  .then(() => refreshTree(workspace))
+                  .then(() => refreshTree())
                   .catch((e) => setStatus(`${e}`));
               },
             }),
@@ -1092,11 +1309,22 @@ export default function App() {
                         const cmdPath = (await getAppConfig()).sshCommandPath;
                         await sshRenamePath(sshProfile!, cmdPath, node.path, to);
                         applyRename();
-                        // A renamed folder relocates every descendant's
-                        // path, which a local splice doesn't attempt -
-                        // simpler and safer to just re-fetch here, since
-                        // renames are rare compared to plain saves.
-                        await refreshTree(workspace);
+                        // renameTreeNode rewrites the node's own path and
+                        // every already-loaded descendant's path prefix
+                        // in memory - no re-fetch needed even for a
+                        // folder, since anything not yet loaded is still
+                        // unloaded either way and gets requested under
+                        // the new path whenever it's expanded.
+                        setTree((prev) => renameTreeNode(prev, node.path, to));
+                        setExpanded((prev) => {
+                          const next = new Set<string>();
+                          for (const p of prev) {
+                            if (p === node.path) next.add(to);
+                            else if (p.startsWith(`${node.path}/`)) next.add(to + p.slice(node.path.length));
+                            else next.add(p);
+                          }
+                          return next;
+                        });
                       } catch (e) {
                         setStatus(`${e}`);
                       }
@@ -1106,7 +1334,7 @@ export default function App() {
                   void renamePath(node.path, to)
                     .then(() => {
                       applyRename();
-                      return refreshTree(workspace);
+                      return refreshTree();
                     })
                     .catch((e) => setStatus(`${e}`));
                 },
@@ -1123,7 +1351,16 @@ export default function App() {
                     const cmdPath = (await getAppConfig()).sshCommandPath;
                     await sshTrashPath(sshProfile!, cmdPath, node.path);
                     setStatus(`Moved ${node.name} to .kotoshelf/.trash`);
-                    await refreshTree(workspace);
+                    // We know exactly what was removed - splice it out
+                    // rather than re-walking the remote tree.
+                    setTree((prev) => removeTreeNode(prev, node.path));
+                    setExpanded((prev) => {
+                      const next = new Set(prev);
+                      for (const p of prev) {
+                        if (p === node.path || p.startsWith(`${node.path}/`)) next.delete(p);
+                      }
+                      return next;
+                    });
                   } catch (e) {
                     setStatus(`${e}`);
                   }
@@ -1133,7 +1370,7 @@ export default function App() {
               void trashPath(node.path)
                 .then(() => {
                   setStatus(`Moved ${node.name} to trash`);
-                  return refreshTree(workspace);
+                  return refreshTree();
                 })
                 .catch((e) => setStatus(`${e}`));
               // Tabs pointing at the deleted path stay open (VS Code
@@ -1279,7 +1516,9 @@ export default function App() {
     openSshTerminal: () => void openSshTerminal(),
     save: () => void saveActive(),
     saveAs: () => void saveActive(true),
+    saveAll: () => void saveAll(),
     closeActiveTab: () => closeTab(activeIndex),
+    closeAllTabs: () => closeAllTabs(),
     exit: () => void getCurrentWindow().close(),
     undo: () => {
       const v = editorViewRef.current;
@@ -1316,11 +1555,47 @@ export default function App() {
 
   // Webview-side fallback for chords the native accelerator may not
   // deliver (platform differences). dedup() prevents double handling.
+  //
+  // Also handles VS Code-style two-stage chords (Ctrl+K, then a second
+  // key within chordTimeoutMs) for tab operations - Save All (Ctrl+K S)
+  // and Close All Tabs (Ctrl+K Ctrl+W). A native menu accelerator can
+  // only express one simultaneous modifier+key combo, not a sequence, so
+  // these exist only here, not as a real OS-level shortcut (the menu
+  // items just document them in their label text).
+  const chordTimeoutRef = useRef<number | null>(null);
   useEffect(() => {
+    const clearChord = () => {
+      if (chordTimeoutRef.current !== null) {
+        window.clearTimeout(chordTimeoutRef.current);
+        chordTimeoutRef.current = null;
+      }
+    };
     const handler = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
-      if (!mod) return;
       const c = commandsRef.current;
+
+      if (chordTimeoutRef.current !== null) {
+        const key = e.key.toLowerCase();
+        clearChord();
+        if (key === "s" && !mod) {
+          e.preventDefault();
+          dedup("saveAll", c.saveAll);
+        } else if (key === "w" && mod) {
+          e.preventDefault();
+          dedup("closeAllTabs", c.closeAllTabs);
+        }
+        // Any other second key just cancels the chord (and is otherwise
+        // left alone - not swallowed - since it wasn't meant for us).
+        return;
+      }
+
+      if (mod && e.key.toLowerCase() === "k" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        chordTimeoutRef.current = window.setTimeout(clearChord, 1500);
+        return;
+      }
+
+      if (!mod) return;
       const key = e.key.toLowerCase();
       if (key === "s") {
         e.preventDefault();
@@ -1358,8 +1633,10 @@ export default function App() {
       }
     };
     window.addEventListener("keydown", handler, { capture: true });
-    return () =>
+    return () => {
       window.removeEventListener("keydown", handler, { capture: true });
+      clearChord();
+    };
   }, []);
 
   // ---- render ---------------------------------------------------------
@@ -1402,6 +1679,9 @@ export default function App() {
         {leftPane === "search" && workspace ? (
           <SearchPanel
             workspace={workspace}
+            onSearch={handleSearch}
+            onReplace={handleReplace}
+            excludeConfigSupported={!(workspaceKind === "ssh" && sshProfile)}
             onOpenMatch={(target) => void handleSearchOpenMatch(target)}
             onStatus={setStatus}
           />
@@ -1428,7 +1708,7 @@ export default function App() {
                   type="button"
                   className="text-sm rounded bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 px-2 py-1"
                   title="Refresh tree"
-                  onClick={() => void refreshTree(workspace)}
+                  onClick={() => void refreshTree()}
                 >
                   ⟳
                 </button>
@@ -1447,6 +1727,8 @@ export default function App() {
               {workspace ? (
                 <FileTree
                   nodes={tree}
+                  expanded={expanded}
+                  onToggle={(node) => void handleToggleDir(node)}
                   onOpenFile={(p) => void openFile(p)}
                   activePath={activeTab?.path ?? null}
                   onNodeMenu={(node, x, y) => setTreeMenu({ x, y, node })}

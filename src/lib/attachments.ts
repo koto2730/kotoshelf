@@ -84,6 +84,29 @@ export function mimeTypeOf(path: string): string {
   return IMAGE_MIME_TYPES[extensionOf(path)] ?? "application/octet-stream";
 }
 
+/** Decodes base64 into a `blob:` object URL rather than building a
+ * `data:${mime};base64,...` string directly: a `data:` URI embeds the
+ * whole (base64-inflated, ~33% larger) payload as one string that lives
+ * in React state and the DOM `src` attribute, where a several-MB image
+ * ends up duplicated across renders. A blob URL is a small handle to
+ * binary data the browser holds separately. Callers must
+ * `URL.revokeObjectURL` it when it's no longer shown, or replaced. */
+export function base64ToObjectUrl(base64: string, mimeType: string): string {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+/** Decodes base64 (as returned by sshReadFileGuarded) into text, the
+ * counterpart of base64ToObjectUrl for the non-image branch of opening a
+ * file over SSH. */
+export function base64ToUtf8(base64: string): string {
+  const binary = atob(base64);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 export function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();

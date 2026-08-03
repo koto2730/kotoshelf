@@ -1,11 +1,6 @@
 import { useEffect, useState } from "react";
-import type { FileSearchResult } from "../lib/fs";
-import {
-  searchWorkspace,
-  replaceInFiles,
-  getSearchConfig,
-  setSearchConfig,
-} from "../lib/fs";
+import type { FileSearchResult, ReplaceResult } from "../lib/fs";
+import { getSearchConfig, setSearchConfig } from "../lib/fs";
 import { basename } from "../lib/tabs";
 
 export interface SearchOpenTarget {
@@ -16,7 +11,10 @@ export interface SearchOpenTarget {
 }
 
 /**
- * Workspace-wide find/replace. Search runs in Rust (search_workspace) so
+ * Workspace-wide find/replace. Search/replace themselves are dispatched
+ * by the caller (App.tsx branches on local vs SSH) rather than called
+ * directly here, so this component doesn't need to know which kind of
+ * workspace it's searching - it runs server-side in Rust either way, so
  * a few thousand notes don't need to round-trip full file contents
  * through IPC just to grep them. Replace All operates only on files the
  * current result set touched - re-running search after a replace keeps
@@ -24,10 +22,26 @@ export interface SearchOpenTarget {
  */
 export function SearchPanel({
   workspace,
+  onSearch,
+  onReplace,
+  excludeConfigSupported,
   onOpenMatch,
   onStatus,
 }: {
   workspace: string;
+  onSearch: (query: string, isRegex: boolean, caseSensitive: boolean) => Promise<FileSearchResult[]>;
+  onReplace: (
+    paths: string[],
+    query: string,
+    replacement: string,
+    isRegex: boolean,
+    caseSensitive: boolean,
+  ) => Promise<ReplaceResult[]>;
+  /** Exclude-pattern config is stored as a local file next to the
+   * workspace root (`.kotoshelf/search.json`) - there's no remote
+   * counterpart yet, so the editor is hidden rather than silently doing
+   * nothing over SSH. */
+  excludeConfigSupported: boolean;
   onOpenMatch: (target: SearchOpenTarget) => void;
   onStatus: (message: string) => void;
 }) {
@@ -45,8 +59,9 @@ export function SearchPanel({
   // workspace changes, so the editor has something to show without an
   // extra click.
   useEffect(() => {
+    if (!excludeConfigSupported) return;
     void getSearchConfig(workspace).then((c) => setExcludeText(c.exclude.join("\n")));
-  }, [workspace]);
+  }, [workspace, excludeConfigSupported]);
 
   const saveExcludes = async () => {
     const patterns = excludeText
@@ -71,7 +86,7 @@ export function SearchPanel({
     }
     setSearching(true);
     try {
-      const r = await searchWorkspace(workspace, query, isRegex, caseSensitive);
+      const r = await onSearch(query, isRegex, caseSensitive);
       setResults(r);
       onStatus(
         `${r.reduce((s, f) => s + f.matches.length, 0)} matches in ${r.length} files`,
@@ -90,7 +105,7 @@ export function SearchPanel({
     );
     if (!ok) return;
     try {
-      const changed = await replaceInFiles(
+      const changed = await onReplace(
         results.map((r) => r.path),
         query,
         replacement,
@@ -167,14 +182,16 @@ export function SearchPanel({
             Replace All
           </button>
         </div>
-        <button
-          type="button"
-          className="text-left text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
-          onClick={() => setShowExcludeEditor((v) => !v)}
-        >
-          {showExcludeEditor ? "▾" : "▸"} Exclude patterns…
-        </button>
-        {showExcludeEditor && (
+        {excludeConfigSupported && (
+          <button
+            type="button"
+            className="text-left text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
+            onClick={() => setShowExcludeEditor((v) => !v)}
+          >
+            {showExcludeEditor ? "▾" : "▸"} Exclude patterns…
+          </button>
+        )}
+        {excludeConfigSupported && showExcludeEditor && (
           <div className="flex flex-col gap-1.5 pt-1 border-t border-slate-200 dark:border-slate-800">
             <div className="text-xs text-slate-500">
               One glob per line (e.g. <code>**/*.txt</code>), matched against
