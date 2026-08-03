@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { crosshairCursor, rectangularSelection, type EditorView, type ViewUpdate } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { LanguageDescription } from "@codemirror/language";
+import type { Extension } from "@codemirror/state";
 import { languages } from "@codemirror/language-data";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { redo, selectAll, undo } from "@codemirror/commands";
@@ -245,6 +247,36 @@ export default function App() {
   // highlighting) applies to .md buffers; anything else stays plain.
   const isMarkdownTab = activeTab?.name.toLowerCase().endsWith(".md") ?? false;
 
+  // Non-markdown tabs get syntax highlighting by matching the file name
+  // against @codemirror/language-data's ~200-language table - the same
+  // `languages` list markdown's fenced code blocks already use via
+  // `codeLanguages` below, just matched by the whole file's name instead
+  // of a fence's language tag. Not meant to be authoritative (a
+  // misdetected/unknown extension just falls back to plain text) - only
+  // readable, so an exact-match-by-extension lookup is enough.
+  // LanguageDescription.load() dynamically imports the matched
+  // language's package and caches the result itself, so calling it again
+  // for a language already loaded elsewhere in the app is free.
+  const [fileLangExtension, setFileLangExtension] = useState<Extension | null>(null);
+  useEffect(() => {
+    if (isMarkdownTab || !activeTab?.name) {
+      setFileLangExtension(null);
+      return;
+    }
+    const desc = LanguageDescription.matchFilename(languages, activeTab.name);
+    if (!desc) {
+      setFileLangExtension(null);
+      return;
+    }
+    let cancelled = false;
+    void desc.load().then((support) => {
+      if (!cancelled) setFileLangExtension(support);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isMarkdownTab, activeTab?.name]);
+
   // Callbacks used inside the (memoised) editor extensions go through a
   // ref so the extensions never capture stale state - same pattern as
   // the native-menu commands ref.
@@ -273,7 +305,7 @@ export default function App() {
     // Alt+drag box selection - applies to every buffer, not just
     // Markdown ones, so it lives outside the isMarkdownTab branch below.
     const base = [rectangularSelection(), crosshairCursor()];
-    if (!isMarkdownTab) return base;
+    if (!isMarkdownTab) return fileLangExtension ? [...base, fileLangExtension] : base;
     return [
       ...base,
       markdown({
@@ -294,7 +326,7 @@ export default function App() {
     // re-render Live Preview's colors immediately, same as any other
     // markdown-mode extension change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMarkdownTab, resolvedTheme]);
+  }, [isMarkdownTab, resolvedTheme, fileLangExtension]);
 
   // ---- workspace ----------------------------------------------------
 
@@ -616,9 +648,13 @@ export default function App() {
   /** Save the active tab. Returns the saved path, or null when the user
    * cancelled the dialog / nothing to save / write failed - callers like
    * the save-then-attach flow need to know whether to continue. */
-  const saveActive = useCallback(
-    async (forceDialog = false): Promise<string | null> => {
-      const tab = activeIndex >= 0 ? tabs[activeIndex] : undefined;
+  // Parameterized by index (rather than always reading activeIndex) so
+  // saveAll can drive it across every dirty tab in turn, not just the
+  // active one - saveActive below is just this called with the active
+  // tab's index.
+  const saveTabAt = useCallback(
+    async (index: number, forceDialog = false): Promise<string | null> => {
+      const tab = tabs[index];
       if (!tab) return null;
       // An image tab has no text content to write - its content/
       // savedContent are always "". Without this guard, Ctrl+S while
@@ -655,7 +691,7 @@ export default function App() {
           await sshWriteFile(sshProfile, config.sshCommandPath, targetPath, tab.content);
           setTabs((prev) =>
             prev.map((t, i) =>
-              i === activeIndex
+              i === index
                 ? { ...t, path: targetPath, name: basename(targetPath!), savedContent: t.content }
                 : t,
             ),
@@ -689,7 +725,7 @@ export default function App() {
         await writeFile(targetPath, tab.content);
         setTabs((prev) =>
           prev.map((t, i) =>
-            i === activeIndex
+            i === index
               ? {
                   ...t,
                   path: targetPath,
@@ -707,8 +743,40 @@ export default function App() {
         return null;
       }
     },
-    [activeIndex, tabs, workspace, workspaceKind, sshProfile, refreshTree],
+    [tabs, workspace, workspaceKind, sshProfile, refreshTree],
   );
+
+  const saveActive = useCallback(
+    (forceDialog = false): Promise<string | null> => saveTabAt(activeIndex, forceDialog),
+    [saveTabAt, activeIndex],
+  );
+
+  const saveAll = useCallback(async () => {
+    const dirtyIndexes = tabs
+      .map((_, i) => i)
+      .filter((i) => tabs[i].kind !== "image" && isDirty(tabs[i]));
+    if (dirtyIndexes.length === 0) {
+      setStatus("Nothing to save");
+      return;
+    }
+    let saved = 0;
+    for (const i of dirtyIndexes) {
+      if ((await saveTabAt(i)) !== null) saved++;
+    }
+    setStatus(`Saved ${saved} of ${dirtyIndexes.length} file(s)`);
+  }, [tabs, saveTabAt]);
+
+  const closeAllTabs = useCallback(() => {
+    const dirtyCount = tabs.filter((t) => isDirty(t)).length;
+    if (dirtyCount > 0) {
+      const ok = window.confirm(
+        `${dirtyCount} file(s) have unsaved changes. Close all tabs anyway?`,
+      );
+      if (!ok) return;
+    }
+    setTabs([]);
+    setActiveIndex(-1);
+  }, [tabs]);
 
   const closeTab = useCallback(
     (index: number) => {
@@ -1448,7 +1516,9 @@ export default function App() {
     openSshTerminal: () => void openSshTerminal(),
     save: () => void saveActive(),
     saveAs: () => void saveActive(true),
+    saveAll: () => void saveAll(),
     closeActiveTab: () => closeTab(activeIndex),
+    closeAllTabs: () => closeAllTabs(),
     exit: () => void getCurrentWindow().close(),
     undo: () => {
       const v = editorViewRef.current;
@@ -1485,11 +1555,47 @@ export default function App() {
 
   // Webview-side fallback for chords the native accelerator may not
   // deliver (platform differences). dedup() prevents double handling.
+  //
+  // Also handles VS Code-style two-stage chords (Ctrl+K, then a second
+  // key within chordTimeoutMs) for tab operations - Save All (Ctrl+K S)
+  // and Close All Tabs (Ctrl+K Ctrl+W). A native menu accelerator can
+  // only express one simultaneous modifier+key combo, not a sequence, so
+  // these exist only here, not as a real OS-level shortcut (the menu
+  // items just document them in their label text).
+  const chordTimeoutRef = useRef<number | null>(null);
   useEffect(() => {
+    const clearChord = () => {
+      if (chordTimeoutRef.current !== null) {
+        window.clearTimeout(chordTimeoutRef.current);
+        chordTimeoutRef.current = null;
+      }
+    };
     const handler = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
-      if (!mod) return;
       const c = commandsRef.current;
+
+      if (chordTimeoutRef.current !== null) {
+        const key = e.key.toLowerCase();
+        clearChord();
+        if (key === "s" && !mod) {
+          e.preventDefault();
+          dedup("saveAll", c.saveAll);
+        } else if (key === "w" && mod) {
+          e.preventDefault();
+          dedup("closeAllTabs", c.closeAllTabs);
+        }
+        // Any other second key just cancels the chord (and is otherwise
+        // left alone - not swallowed - since it wasn't meant for us).
+        return;
+      }
+
+      if (mod && e.key.toLowerCase() === "k" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        chordTimeoutRef.current = window.setTimeout(clearChord, 1500);
+        return;
+      }
+
+      if (!mod) return;
       const key = e.key.toLowerCase();
       if (key === "s") {
         e.preventDefault();
@@ -1527,8 +1633,10 @@ export default function App() {
       }
     };
     window.addEventListener("keydown", handler, { capture: true });
-    return () =>
+    return () => {
       window.removeEventListener("keydown", handler, { capture: true });
+      clearChord();
+    };
   }, []);
 
   // ---- render ---------------------------------------------------------
