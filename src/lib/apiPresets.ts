@@ -11,8 +11,22 @@ export interface ApiPreset {
    * order and allows duplicate header names (rare but valid HTTP). */
   headers: [string, string][];
   bodyTemplate: string;
+  /** Prepended (as {{selection}}, before the rest of the template
+   * placeholders are resolved) before the actual editor selection when
+   * building the request - lets a preset carry a fixed instruction/
+   * system-prompt-like prefix without the user retyping it into the
+   * buffer each time. Empty means no prefix. */
+  promptTemplate: string;
   responseJsonPath: string | null;
   responseTarget: ResponseTarget;
+  /** Dotted JSON paths into the raw response body (same engine as
+   * responseJsonPath) for a stateful API's session id / last-updated
+   * fields. Optional - most presets have no notion of a session. When
+   * set and found in the response, App.tsx appends them as plain
+   * "SessionID: .../session_updated: ..." lines after the inserted
+   * response text. */
+  sessionIdPath: string | null;
+  sessionUpdatedPath: string | null;
 }
 
 export function newPreset(name: string): ApiPreset {
@@ -22,8 +36,11 @@ export function newPreset(name: string): ApiPreset {
     method: "POST",
     headers: [],
     bodyTemplate: "",
+    promptTemplate: "",
     responseJsonPath: null,
     responseTarget: "newTab",
+    sessionIdPath: null,
+    sessionUpdatedPath: null,
   };
 }
 

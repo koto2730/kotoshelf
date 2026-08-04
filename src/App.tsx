@@ -74,7 +74,7 @@ import { dedup, installAppMenu, type AppCommands } from "./lib/menu";
 import { SendPalette } from "./components/SendPalette";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { getAppConfig, sendRequest, type ApiPreset } from "./lib/apiPresets";
-import { renderTemplate } from "./lib/apiTemplateRenderer";
+import { extractSessionId, renderTemplate } from "./lib/apiTemplateRenderer";
 import { extractJsonPath } from "./lib/jsonPath";
 import {
   BUILTIN_LIGHT,
@@ -469,6 +469,29 @@ export default function App() {
         setActiveIndex(existing);
         return;
       }
+      // Appends inside the setTabs updater itself, re-checking for an
+      // existing tab there rather than trusting the `existing` check
+      // above - that check only sees the `tabs` snapshot from when this
+      // openFile() call started, so two concurrent openFile() calls for
+      // the same brand-new path (e.g. "New File..." immediately
+      // followed by a click on the file that just appeared in the tree,
+      // or React StrictMode's dev-only double-invoke of this same async
+      // callback) could otherwise both pass that check before either
+      // had actually added a tab, producing two tabs for one path. The
+      // updater form is applied against React's true latest state, so
+      // the second call always sees the first call's tab once it lands.
+      const appendTabIfMissing = (makeTab: () => Tab) => {
+        setTabs((prev) => {
+          const i = prev.findIndex((t) => t.path === path);
+          if (i >= 0) {
+            setActiveIndex(i);
+            return prev;
+          }
+          const next = [...prev, makeTab()];
+          setActiveIndex(next.length - 1);
+          return next;
+        });
+      };
       try {
         // An image file used to get read as text - its raw bytes
         // reinterpreted as UTF-8 into a CodeMirror buffer, i.e. visible
@@ -497,8 +520,7 @@ export default function App() {
           } else {
             imageSrc = convertFileSrc(path);
           }
-          setTabs((prev) => [...prev, makeImageTab(path, imageSrc)]);
-          setActiveIndex(tabs.length);
+          appendTabIfMissing(() => makeImageTab(path, imageSrc));
           return;
         }
 
@@ -525,8 +547,7 @@ export default function App() {
         } else {
           content = await readFile(path);
         }
-        setTabs((prev) => [...prev, makeFileTab(path, content)]);
-        setActiveIndex(tabs.length);
+        appendTabIfMissing(() => makeFileTab(path, content));
       } catch (e) {
         setStatus(`${e}`);
       }
@@ -1455,10 +1476,28 @@ export default function App() {
       setStatus(`Sending to '${preset.name}'…`);
       try {
         const config = await getAppConfig();
+        const filename = tab.name.replace(/\.[^.]+$/, "");
+        // The session id travels with the selection itself (a
+        // "SessionID: ..." line left there by a previous response - see
+        // extractSessionId), not with the preset, so it's read fresh
+        // from whatever text is selected right now.
+        const sessionId = extractSessionId(selectionText);
+        const renderedPrompt = preset.promptTemplate
+          ? renderTemplate(preset.promptTemplate, {
+              selection: "",
+              filename,
+              tokens: config.tokens,
+              sessionId,
+            })
+          : "";
+        const combinedSelection = renderedPrompt
+          ? `${renderedPrompt}\n\n${selectionText}`
+          : selectionText;
         const ctx = {
-          selection: selectionText,
-          filename: tab.name.replace(/\.[^.]+$/, ""),
+          selection: combinedSelection,
+          filename,
           tokens: config.tokens,
+          sessionId,
         };
         const url = renderTemplate(preset.url, ctx);
         const body = preset.bodyTemplate
@@ -1471,26 +1510,52 @@ export default function App() {
 
         const response = await sendRequest({ url, method: preset.method, headers, body });
         if (response.status < 200 || response.status >= 300) {
-          setStatus(`Send failed: HTTP ${response.status}`);
+          // The error body (usually the API's own explanation - a
+          // missing header, bad auth, malformed JSON, etc.) was
+          // previously discarded here, leaving just the status code to
+          // debug from. Surface it in a tab so it's actually readable.
+          const errTab = makeUntitledTab();
+          errTab.content = response.body;
+          setTabs((prev) => [...prev, errTab]);
+          setActiveIndex(tabs.length);
+          setStatus(`Send failed: HTTP ${response.status} (see new tab for response body)`);
           return;
         }
         const extracted = preset.responseJsonPath
           ? extractJsonPath(response.body, preset.responseJsonPath) ?? response.body
           : response.body;
 
+        // Session bookkeeping lines, read from the *raw* response body
+        // (independent of responseJsonPath, since the session id/updated
+        // fields usually live outside whatever the preset extracts as
+        // the "real" content) and appended after it so a later send can
+        // pick them back up via extractSessionId/{{sessionId}}.
+        const sessionLines: string[] = [];
+        if (preset.sessionIdPath) {
+          const v = extractJsonPath(response.body, preset.sessionIdPath);
+          if (v) sessionLines.push(`SessionID: ${v}`);
+        }
+        if (preset.sessionUpdatedPath) {
+          const v = extractJsonPath(response.body, preset.sessionUpdatedPath);
+          if (v) sessionLines.push(`session_updated: ${v}`);
+        }
+        const extractedWithSession = sessionLines.length
+          ? `${extracted}${extracted.endsWith("\n") ? "" : "\n"}${sessionLines.join("\n")}\n`
+          : extracted;
+
         if (preset.responseTarget === "newTab") {
           const newTab = makeUntitledTab();
-          newTab.content = extracted;
+          newTab.content = extractedWithSession;
           setTabs((prev) => [...prev, newTab]);
           setActiveIndex(tabs.length);
         } else if (preset.responseTarget === "afterSelection") {
           const end = sel.to;
           const needsNewlineBefore =
             end > 0 && view.state.sliceDoc(end - 1, end) !== "\n";
-          const needsNewlineAfter = !extracted.endsWith("\n");
+          const needsNewlineAfter = !extractedWithSession.endsWith("\n");
           const payload =
             (needsNewlineBefore ? "\n" : "") +
-            extracted +
+            extractedWithSession +
             (needsNewlineAfter ? "\n" : "");
           view.dispatch({ changes: { from: end, to: end, insert: payload } });
           onEdit(view.state.doc.toString());
@@ -1541,7 +1606,15 @@ export default function App() {
     zoomOut: () => setZoom((z) => Math.max(z - 10, 50)),
     zoomReset: () => setZoom(100),
     togglePreview: () => setPreviewVisible((v) => !v),
-    openSendPalette: () => setSendPaletteOpen(true),
+    openSendPalette: () => {
+      // CodeMirror's contentEditable holds DOM focus tightly; opening the
+      // palette on top of it without an explicit blur can leave the
+      // editor as document.activeElement even after the palette mounts
+      // with autoFocus, so arrow keys/Enter keep going to the buffer
+      // instead of the picker.
+      editorViewRef.current?.contentDOM.blur();
+      setSendPaletteOpen(true);
+    },
     openSettings: () => setSettingsOpen(true),
     openThemeDialog: () => setThemeDialogOpen(true),
   };

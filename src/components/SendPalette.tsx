@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ApiPreset } from "../lib/apiPresets";
 
 /** Ctrl+; preset picker, ported from kotomemo's SendPaletteDialog:
@@ -15,6 +15,20 @@ export function SendPalette({
   onClose: () => void;
 }) {
   const [highlight, setHighlight] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // autoFocus alone isn't reliable here: this dialog is opened from a
+  // native menu accelerator / webview keydown fallback while CodeMirror's
+  // contentEditable still holds focus, and in that situation the browser
+  // sometimes leaves focus on the editor even though this element is
+  // freshly mounted with autoFocus. Re-asserting focus after paint (and
+  // once more shortly after, in case the editor's own focus handling
+  // races it) makes the takeover stick.
+  useEffect(() => {
+    containerRef.current?.focus();
+    const retry = window.setTimeout(() => containerRef.current?.focus(), 50);
+    return () => window.clearTimeout(retry);
+  }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
@@ -55,9 +69,10 @@ export function SendPalette({
         // keydown (digits, Enter, arrows), and since editor text was
         // selected right before Ctrl+; was pressed, typing e.g. "1" to
         // pick a preset replaced the selection with the digit - the
-        // selected text silently vanished from the document. autoFocus +
-        // handling keys here (with preventDefault) stops that fallthrough.
-        autoFocus
+        // selected text silently vanished from the document. The
+        // focus-stealing effect above + handling keys here (with
+        // preventDefault) stops that fallthrough.
+        ref={containerRef}
         tabIndex={-1}
         onKeyDown={handleKeyDown}
         className="w-[480px] max-h-[60vh] overflow-y-auto rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl py-1 outline-none"

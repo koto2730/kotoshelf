@@ -22,10 +22,25 @@ struct ApiPreset {
     headers: Vec<(String, String)>,
     #[serde(default)]
     body_template: String,
+    /// Prepended before the editor selection when resolving
+    /// {{selection}} at send-time (see the frontend's ApiPreset.promptTemplate).
+    #[serde(default)]
+    prompt_template: String,
     #[serde(default)]
     response_json_path: Option<String>,
     #[serde(default)]
     response_target: String, // "newTab" | "afterSelection" | "statusOnly"
+    /// Dotted JSON paths into the raw response body (same syntax/engine
+    /// as response_json_path) for a stateful API's session id and
+    /// last-updated fields, if any - opt-in per preset since most
+    /// presets have no notion of a session. When set and found, the
+    /// frontend appends them as plain "SessionID: .../session_updated:
+    /// ..." lines after the inserted response, so selecting that block
+    /// again and re-sending can thread the id back in via {{sessionId}}.
+    #[serde(default)]
+    session_id_path: Option<String>,
+    #[serde(default)]
+    session_updated_path: Option<String>,
 }
 
 fn default_method() -> String {

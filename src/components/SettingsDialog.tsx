@@ -183,7 +183,15 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                         placeholder={"Authorization: Bearer {{tokens.openai}}\nContent-Type: application/json"}
                       />
                     </Field>
-                    <Field label="Body template — use {{selection}}, {{selectionJson}}, {{tokens.NAME}}">
+                    <Field label="Prompt — prepended before the selection as {{selection}} is resolved (optional)">
+                      <textarea
+                        className="input h-16 font-mono"
+                        spellCheck={false}
+                        value={selected.promptTemplate}
+                        onChange={(e) => updateSelected({ promptTemplate: e.target.value })}
+                      />
+                    </Field>
+                    <Field label="Body template — use {{selection}}, {{selectionJson}}, {{tokens.NAME}}, {{sessionId}} (empty string if none), {{sessionIdJson}} (unquoted - null or a quoted string, for a field that must be JSON null rather than &quot;&quot;)">
                       <textarea
                         className="input h-28 font-mono"
                         spellCheck={false}
@@ -200,6 +208,26 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                         }
                       />
                     </Field>
+                    <div className="flex gap-2">
+                      <Field label="Session ID JSON path (optional)" className="flex-1">
+                        <input
+                          className="input"
+                          value={selected.sessionIdPath ?? ""}
+                          onChange={(e) =>
+                            updateSelected({ sessionIdPath: e.target.value || null })
+                          }
+                        />
+                      </Field>
+                      <Field label="Session updated JSON path (optional)" className="flex-1">
+                        <input
+                          className="input"
+                          value={selected.sessionUpdatedPath ?? ""}
+                          onChange={(e) =>
+                            updateSelected({ sessionUpdatedPath: e.target.value || null })
+                          }
+                        />
+                      </Field>
+                    </div>
                   </>
                 ) : (
                   <div className="flex-1 flex items-center justify-center text-slate-400">
