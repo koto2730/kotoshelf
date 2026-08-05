@@ -211,6 +211,16 @@ export function sshTestConnection(profile: SshProfile, sshCommandPath: string): 
   return invoke<string>("ssh_test_connection", { profile, sshCommandPath });
 }
 
+/** Deploys (if not already cached on the remote host) and connects to
+ * the persistent SSH agent - see `agent-protocol`/`agent` and
+ * `ssh_agent_connect` in lib.rs. Best-effort by design: callers should
+ * swallow a rejection and keep going, since every SSH command still
+ * works without it, just slower (each falls back to its own
+ * per-operation `ssh` shell-out when no agent session is connected). */
+export function sshAgentConnect(profile: SshProfile, sshCommandPath: string): Promise<void> {
+  return invoke("ssh_agent_connect", { profile, sshCommandPath });
+}
+
 /** Opens a new terminal window already `cd`'d into the remote workspace
  * folder over SSH (Windows Terminal / Terminal.app / a common Linux
  * emulator, depending on platform). */

@@ -86,6 +86,7 @@ import {
 import { ThemeDialog } from "./components/ThemeDialog";
 import { RemoteWorkspaceDialog } from "./components/RemoteWorkspaceDialog";
 import {
+  sshAgentConnect,
   sshListAllPaths,
   sshReadFileGuarded,
   sshReadTreeShallow,
@@ -439,6 +440,14 @@ export default function App() {
     sshImageCache.current.clear();
     try {
       const config = await getAppConfig();
+      try {
+        await sshAgentConnect(profile, config.sshCommandPath);
+      } catch {
+        // Best-effort perf optimization - every SSH command below still
+        // works without it (falls back to its own per-operation `ssh`
+        // shell-out), so a deploy/connect failure here isn't worth
+        // surfacing as a workspace-open failure.
+      }
       setTree(await sshReadTreeShallow(profile, config.sshCommandPath, ""));
       const target = profile.user ? `${profile.user}@${profile.host}` : profile.host;
       setStatus(`Workspace (SSH): ${target}:${profile.remotePath}`);

@@ -1,0 +1,11 @@
+[package]
+name = "kotoshelf-agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kotoshelf-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
