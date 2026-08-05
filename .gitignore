@@ -16,6 +16,10 @@ dist-ssr
 src-tauri/target
 src-tauri/gen
 
+# SSH agent crates' build outputs
+agent/target
+agent-protocol/target
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

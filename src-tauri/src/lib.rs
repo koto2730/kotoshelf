@@ -1,3 +1,4 @@
+use agent_protocol::{MAX_DEPTH, SKIP_DIRS, TreeNode};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -240,90 +241,17 @@ fn set_selected_theme(name: String) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {path:?}: {e}"))
 }
 
-/// One node of the workspace file tree. `children` is `Some` for
-/// directories (possibly empty) and `None` for files, so the frontend can
-/// distinguish "empty dir" from "file" without consulting `is_dir` twice.
-/// `size` is 0 for directories - carried alongside the listing (rather
-/// than fetched separately per file) so the frontend can flag large
-/// files without a extra round trip per open, which matters most for
-/// SSH workspaces where "a round trip" means a network hop.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TreeNode {
-    name: String,
-    path: String,
-    is_dir: bool,
-    children: Option<Vec<TreeNode>>,
-    size: u64,
-}
-
-/// Directories that never belong in a notes workspace listing. Keeping
-/// this list in the backend means every caller gets the same filtering.
-const SKIP_DIRS: &[&str] = &[".git", ".kotoshelf", "node_modules", "target"];
-
-/// Hard recursion limit as a guard against pathological or cyclic
-/// (junction/symlink) directory structures.
-const MAX_DEPTH: usize = 24;
-
-/// `max_depth` bounds recursion: a directory at `depth >= max_depth` gets
-/// `children: None` instead of being walked, the same `None` a file
-/// already uses - the frontend already treats "directory with no
-/// children" as "not loaded yet" (see `insertTreeDir`), so this reuses
-/// that meaning rather than adding a new field. `read_tree` (unbounded)
-/// and `read_tree_shallow` (`max_depth: 1`, used for the lazy tree pane)
-/// share this one walker.
-fn build_tree(dir: &Path, depth: usize, max_depth: usize) -> Vec<TreeNode> {
-    if depth >= max_depth {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-
-    let mut nodes: Vec<TreeNode> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = path.is_dir();
-        if is_dir && SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        let children = if is_dir && depth + 1 < max_depth {
-            Some(build_tree(&path, depth + 1, max_depth))
-        } else {
-            None
-        };
-        let size = if is_dir {
-            0
-        } else {
-            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-        };
-        nodes.push(TreeNode {
-            name,
-            path: path.to_string_lossy().into_owned(),
-            is_dir,
-            children,
-            size,
-        });
-    }
-
-    // Directories first, then files; alphabetical (case-insensitive)
-    // within each group - the ordering users expect from VS Code.
-    nodes.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    nodes
-}
-
+/// `TreeNode`/`SKIP_DIRS`/`MAX_DEPTH`/the tree walker itself live in
+/// `agent-protocol` now (imported above) - they're shared with the SSH
+/// agent binary, which runs the exact same walking logic against a
+/// remote host's filesystem instead of this one. These two commands stay
+/// here as thin wrappers because they're Tauri-command-shaped (`String`
+/// args, `#[tauri::command]`) in a way the shared crate deliberately
+/// isn't (it has no Tauri dependency, so it cross-compiles cleanly for
+/// remote targets).
 #[tauri::command]
 fn read_tree(root: String) -> Result<Vec<TreeNode>, String> {
-    let path = Path::new(&root);
-    if !path.is_dir() {
-        return Err(format!("Not a directory: {root}"));
-    }
-    Ok(build_tree(path, 0, MAX_DEPTH))
+    agent_protocol::read_tree(&root)
 }
 
 /// One level of `dir`'s immediate children - subdirectories come back
@@ -334,11 +262,7 @@ fn read_tree(root: String) -> Result<Vec<TreeNode>, String> {
 /// subfolder, since local tree paths are already absolute.
 #[tauri::command]
 fn read_tree_shallow(dir: String) -> Result<Vec<TreeNode>, String> {
-    let path = Path::new(&dir);
-    if !path.is_dir() {
-        return Err(format!("Not a directory: {dir}"));
-    }
-    Ok(build_tree(path, 0, 1))
+    agent_protocol::read_tree_shallow(&dir)
 }
 
 /// Every file path in the workspace (directories omitted), with no
@@ -1130,8 +1054,281 @@ fn ssh_read_tree_script(remote_path: &str) -> String {
     s
 }
 
+// ---------------------------------------------------------------------
+// SSH agent (perf) - a persistent binary deployed to the remote host,
+// reached over one `ssh` subprocess's stdin/stdout, so tree/read/write/
+// search stop paying a fresh `ssh` process spawn + remote shell startup
+// per operation (ControlMaster only saves the TCP+auth handshake, not
+// that - see the SSH-perf plan). Best-effort throughout: any failure to
+// detect/deploy/spawn/talk to the agent just means the caller falls back
+// to the existing per-operation shell-out path below it, so nothing here
+// can turn a working SSH workspace into a broken one.
+// ---------------------------------------------------------------------
+
+/// Identifies which profile a live `AgentSession` belongs to, so a
+/// command against a *different* SSH workspace (opened without
+/// restarting the app) doesn't accidentally reuse a stale connection to
+/// the previous one.
+fn agent_session_key(profile: &SshProfile) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        profile.host,
+        profile.port.unwrap_or(0),
+        profile.user.as_deref().unwrap_or(""),
+        profile.remote_path
+    )
+}
+
+struct AgentSession {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    key: String,
+    next_id: u64,
+}
+
+impl AgentSession {
+    fn call(
+        &mut self,
+        body: agent_protocol::RequestBody,
+    ) -> Result<agent_protocol::ResponseBody, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        agent_protocol::write_frame(&mut self.stdin, &agent_protocol::Request { id, body })
+            .map_err(|e| format!("agent write failed: {e}"))?;
+        let resp: agent_protocol::Response = agent_protocol::read_frame(&mut self.stdout)
+            .map_err(|e| format!("agent read failed: {e}"))?
+            .ok_or_else(|| "agent closed the connection".to_string())?;
+        Ok(resp.body)
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Default)]
+struct AgentRegistry(std::sync::Mutex<Option<AgentSession>>);
+
+/// `None` = no usable agent for this profile (caller should fall back to
+/// the shell-out path). `Some(result)` = the agent handled it - even a
+/// `Err` result is a real answer from the same code path the shell-out
+/// fallback would hit (e.g. "Not a directory"), not a reason to fall
+/// back further. A connection-level problem (broken pipe, agent
+/// exited, protocol mismatch) drops the session so the next call
+/// doesn't keep retrying a dead one.
+fn agent_read_tree(
+    state: &AgentRegistry,
+    profile: &SshProfile,
+) -> Option<Result<Vec<TreeNode>, String>> {
+    let mut guard = state.0.lock().unwrap();
+    let session = guard.as_mut()?;
+    if session.key != agent_session_key(profile) {
+        return None;
+    }
+    let result = session.call(agent_protocol::RequestBody::ReadTree {
+        root: profile.remote_path.clone(),
+    });
+    match result {
+        Ok(agent_protocol::ResponseBody::Tree(nodes)) => Some(Ok(nodes)),
+        Ok(agent_protocol::ResponseBody::Error { message }) => Some(Err(message)),
+        Ok(_) => {
+            *guard = None;
+            None
+        }
+        Err(_) => {
+            *guard = None;
+            None
+        }
+    }
+}
+
+fn agent_read_tree_shallow(
+    state: &AgentRegistry,
+    profile: &SshProfile,
+    rel_path: &str,
+) -> Option<Result<Vec<TreeNode>, String>> {
+    let mut guard = state.0.lock().unwrap();
+    let session = guard.as_mut()?;
+    if session.key != agent_session_key(profile) {
+        return None;
+    }
+    let result = session.call(agent_protocol::RequestBody::ReadTreeShallow {
+        root: profile.remote_path.clone(),
+        rel_path: rel_path.to_string(),
+    });
+    match result {
+        Ok(agent_protocol::ResponseBody::Tree(nodes)) => Some(Ok(nodes)),
+        Ok(agent_protocol::ResponseBody::Error { message }) => Some(Err(message)),
+        Ok(_) => {
+            *guard = None;
+            None
+        }
+        Err(_) => {
+            *guard = None;
+            None
+        }
+    }
+}
+
+/// Maps `uname -sm` output to the prebuilt agent's Rust target triple.
+/// `None` for anything not covered yet (Windows remotes are out of
+/// scope for the agent - see the SSH-perf plan - and any architecture
+/// without a shipped build) - the caller treats that as "no agent for
+/// this host", not a hard error.
+fn agent_target_triple(uname: &str) -> Option<&'static str> {
+    let mut parts = uname.split_whitespace();
+    let os = parts.next()?;
+    let arch = parts.next()?;
+    match (os, arch) {
+        ("Linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("Linux", "aarch64") | ("Linux", "arm64") => Some("aarch64-unknown-linux-gnu"),
+        ("Darwin", "arm64") => Some("aarch64-apple-darwin"),
+        ("Darwin", "x86_64") => Some("x86_64-apple-darwin"),
+        _ => None,
+    }
+}
+
+/// Looks for a prebuilt agent binary for `triple`: first a manually
+/// dropped one at `~/.kotoshelf/agent-bin/<triple>/`, for local
+/// development before the CI cross-build matrix (a later phase of the
+/// SSH-perf plan) exists, then the app's bundled resources (where it'll
+/// live once that CI step ships it).
+fn resolve_agent_binary(app: &tauri::AppHandle, triple: &str) -> Result<PathBuf, String> {
+    use tauri::Manager;
+    if let Some(home) = dirs::home_dir() {
+        let manual = home
+            .join(".kotoshelf")
+            .join("agent-bin")
+            .join(triple)
+            .join("kotoshelf-agent");
+        if manual.is_file() {
+            return Ok(manual);
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir
+            .join("agent-bin")
+            .join(triple)
+            .join("kotoshelf-agent");
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
+    }
+    Err(format!(
+        "No prebuilt agent binary for {triple} (checked ~/.kotoshelf/agent-bin/{triple}/ and the app's bundled resources)"
+    ))
+}
+
+/// Connects (deploying the agent binary to the remote host first if it
+/// isn't already cached there) and stores the session for
+/// `ssh_read_tree`/`ssh_read_tree_shallow` to use. Called once when a
+/// workspace is opened (see `openSshWorkspace` in App.tsx), not lazily
+/// on first operation, so a slow first tree load doesn't also eat the
+/// deploy cost. Errors here are meant to be non-fatal to the caller:
+/// the frontend logs them but keeps going, since every SSH command still
+/// works without an agent, just slower.
 #[tauri::command]
-fn ssh_read_tree(profile: SshProfile, ssh_command_path: String) -> Result<Vec<TreeNode>, String> {
+fn ssh_agent_connect(
+    app: tauri::AppHandle,
+    state: tauri::State<AgentRegistry>,
+    profile: SshProfile,
+    ssh_command_path: String,
+) -> Result<(), String> {
+    let uname = run_ssh_capture(&ssh_command_path, &profile, "uname -sm")?;
+    let triple = agent_target_triple(uname.trim()).ok_or_else(|| {
+        format!("Unsupported remote platform for the SSH agent: {}", uname.trim())
+    })?;
+    let local_bin = resolve_agent_binary(&app, triple)?;
+
+    // Resolved rather than relying on ssh's own `~` expansion, so the
+    // subsequent path can be shell_quote'd (which - correctly - blocks
+    // the shell from expanding anything inside it, `~` included).
+    let home = run_ssh_capture(&ssh_command_path, &profile, "printf '%s' \"$HOME\"")?;
+    let home = home.trim();
+    if home.is_empty() {
+        return Err("Could not resolve the remote $HOME".into());
+    }
+    let remote_bin =
+        format!("{home}/.kotoshelf/agent/kotoshelf-agent-{}", env!("CARGO_PKG_VERSION"));
+
+    let exists = run_ssh_capture(
+        &ssh_command_path,
+        &profile,
+        &format!("test -x {} && echo OK", shell_quote(&remote_bin)),
+    )
+    .map(|s| s.trim() == "OK")
+    .unwrap_or(false);
+
+    if !exists {
+        let bytes = std::fs::read(&local_bin)
+            .map_err(|e| format!("Failed to read local agent binary {local_bin:?}: {e}"))?;
+        let script = format!(
+            "mkdir -p {} && cat > {} && chmod +x {}",
+            shell_quote(&format!("{home}/.kotoshelf/agent")),
+            shell_quote(&remote_bin),
+            shell_quote(&remote_bin),
+        );
+        run_ssh_with_stdin(&ssh_command_path, &profile, &script, &bytes)?;
+    }
+
+    // Every kotoshelf version deploys its agent under its own filename
+    // (so an in-progress upgrade never clobbers/truncates the binary a
+    // still-running older instance has open), but nothing removed the
+    // previous version's file once superseded - left unchecked, an
+    // upgraded-often host accumulates one stale binary per past
+    // version. Prune everything except the one this connect just
+    // confirmed/deployed. Best-effort: run unconditionally (not just
+    // after a fresh upload, since binaries from *before* this cleanup
+    // existed may already be sitting there) and its failure doesn't
+    // block connecting.
+    let cleanup = format!(
+        "find {} -maxdepth 1 -name 'kotoshelf-agent-*' ! -name {} -delete",
+        shell_quote(&format!("{home}/.kotoshelf/agent")),
+        shell_quote(&format!("kotoshelf-agent-{}", env!("CARGO_PKG_VERSION"))),
+    );
+    let _ = run_ssh_capture(&ssh_command_path, &profile, &cleanup);
+
+    let mut cmd = ssh_base_command(&ssh_command_path, &profile, true);
+    cmd.arg(&remote_bin);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start the agent: {e}"))?;
+    let stdin = child.stdin.take().ok_or("Failed to open agent stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to open agent stdout")?;
+
+    let mut session = AgentSession {
+        child,
+        stdin,
+        stdout: std::io::BufReader::new(stdout),
+        key: agent_session_key(&profile),
+        next_id: 0,
+    };
+
+    match session.call(agent_protocol::RequestBody::Ping) {
+        Ok(agent_protocol::ResponseBody::Pong) => {}
+        Ok(_) => return Err("Unexpected response to agent handshake".into()),
+        Err(e) => return Err(format!("Agent handshake failed: {e}")),
+    }
+
+    // Replaces (Drop cleans up) whatever session - if any - was live
+    // before, rather than leaking it: opening a second SSH workspace
+    // without restarting the app is a normal flow.
+    *state.0.lock().unwrap() = Some(session);
+    Ok(())
+}
+
+#[tauri::command]
+fn ssh_read_tree(
+    state: tauri::State<AgentRegistry>,
+    profile: SshProfile,
+    ssh_command_path: String,
+) -> Result<Vec<TreeNode>, String> {
+    if let Some(result) = agent_read_tree(&state, &profile) {
+        return result;
+    }
     let script = ssh_read_tree_script(&profile.remote_path);
     let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
     Ok(parse_ssh_tree(&out))
@@ -1210,11 +1407,15 @@ fn parse_ssh_shallow(raw: &str, base: &str) -> Vec<TreeNode> {
 
 #[tauri::command]
 fn ssh_read_tree_shallow(
+    state: tauri::State<AgentRegistry>,
     profile: SshProfile,
     ssh_command_path: String,
     rel_path: String,
 ) -> Result<Vec<TreeNode>, String> {
     validate_rel_path(&rel_path)?;
+    if let Some(result) = agent_read_tree_shallow(&state, &profile, &rel_path) {
+        return result;
+    }
     let script = ssh_read_tree_shallow_script(&profile.remote_path, &rel_path);
     let out = run_ssh_capture(&ssh_command_path, &profile, &script)?;
     Ok(parse_ssh_shallow(&out, &rel_path))
@@ -1843,6 +2044,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(InitialTargetState(initial_target))
+        .manage(AgentRegistry::default())
         .invoke_handler(tauri::generate_handler![
             read_tree,
             read_tree_shallow,
@@ -1882,7 +2084,8 @@ pub fn run() {
             ssh_search_workspace,
             ssh_replace_in_files,
             ssh_test_connection,
-            ssh_open_terminal
+            ssh_open_terminal,
+            ssh_agent_connect
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1891,6 +2094,43 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_target_triple_maps_known_uname_output() {
+        assert_eq!(agent_target_triple("Linux x86_64"), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(agent_target_triple("Linux aarch64"), Some("aarch64-unknown-linux-gnu"));
+        assert_eq!(agent_target_triple("Darwin arm64"), Some("aarch64-apple-darwin"));
+        assert_eq!(agent_target_triple("Darwin x86_64"), Some("x86_64-apple-darwin"));
+    }
+
+    #[test]
+    fn agent_target_triple_rejects_unknown_or_malformed_uname_output() {
+        assert_eq!(agent_target_triple("Windows_NT x86_64"), None);
+        assert_eq!(agent_target_triple("Linux"), None);
+        assert_eq!(agent_target_triple(""), None);
+    }
+
+    #[test]
+    fn agent_session_key_differs_when_remote_path_differs() {
+        let mut a = SshProfile {
+            name: "a".into(),
+            host: "example.com".into(),
+            port: None,
+            user: Some("me".into()),
+            identity_file: None,
+            remote_path: "/home/me/notes".into(),
+        };
+        let b_key = {
+            let mut b = a.clone();
+            b.remote_path = "/home/me/other".into();
+            agent_session_key(&b)
+        };
+        assert_ne!(agent_session_key(&a), b_key);
+        // Same fields twice must produce the same key (used to detect
+        // "is the live agent session still for *this* workspace").
+        a.name = "renamed".into(); // name isn't part of the connection identity
+        assert_eq!(agent_session_key(&a), agent_session_key(&a.clone()));
+    }
 
     #[test]
     fn rel_path_accepts_ordinary_workspace_paths() {
