@@ -19,7 +19,62 @@ on:
     tags: ["v*"]
 
 jobs:
+  # Mirrors build.yml's build-agents job - see its comments there. Kept
+  # duplicated rather than factored into a reusable workflow since the
+  # two triggers (push-to-main vs. tag) diverge enough elsewhere
+  # (release needs contents: write, has no matrix.label, etc.) that a
+  # shared workflow would need almost as much conditional plumbing as
+  # just keeping them separate.
+  build-agents:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            platform: ubuntu-22.04
+          - triple: aarch64-unknown-linux-gnu
+            platform: ubuntu-22.04
+            cross: true
+          - triple: aarch64-apple-darwin
+            platform: macos-latest
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./agent -> target"
+
+      - name: Install aarch64 cross linker
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure aarch64 cross linker
+        if: matrix.cross
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Build agent
+        run: cargo build --release --manifest-path agent/Cargo.toml --target ${{ matrix.triple }}
+
+      - name: Upload agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.triple }}
+          path: agent/target/${{ matrix.triple }}/release/kotoshelf-agent
+          if-no-files-found: error
+
   release:
+    needs: build-agents
     # GITHUB_TOKEN is read-only by default; creating/updating a release
     # needs contents: write. Without this tauri-action fails with
     # "Resource not accessible by integration" after a successful build.
@@ -61,6 +116,22 @@ jobs:
 
       - name: Install frontend deps
         run: npm ci
+
+      - name: Download agent binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-*
+          path: agent-artifacts
+
+      - name: Stage agent binaries for bundling
+        run: |
+          mkdir -p src-tauri/agent-bin
+          for dir in agent-artifacts/agent-*; do
+            triple="$(basename "$dir" | sed 's/^agent-//')"
+            mkdir -p "src-tauri/agent-bin/$triple"
+            cp "$dir/kotoshelf-agent" "src-tauri/agent-bin/$triple/kotoshelf-agent"
+          done
+          find src-tauri/agent-bin -type f
 
       - uses: tauri-apps/tauri-action@v0
         env:
