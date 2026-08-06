@@ -17,7 +17,67 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Builds the SSH agent binary (see agent/, agent-protocol/ - the
+  # SSH-perf plan's persistent remote agent) for every *remote* target
+  # kotoshelf can connect to, independent of which *desktop* OS is
+  # building the app below - a Windows build of kotoshelf still needs to
+  # be able to deploy a Linux or macOS agent when the user connects to
+  # one. Every build job downloads all of these and bundles them all in,
+  # regardless of its own platform.
+  build-agents:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-gnu
+            platform: ubuntu-22.04
+          - triple: aarch64-unknown-linux-gnu
+            platform: ubuntu-22.04
+            cross: true
+          - triple: aarch64-apple-darwin
+            platform: macos-latest
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./agent -> target"
+
+      # Linux ARM64 is the one target here that isn't native to its
+      # runner - ubuntu-22.04 runners are x86_64, so this cross-compiles
+      # via a separate aarch64 gcc/linker rather than building on real
+      # ARM hardware.
+      - name: Install aarch64 cross linker
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure aarch64 cross linker
+        if: matrix.cross
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Build agent
+        run: cargo build --release --manifest-path agent/Cargo.toml --target ${{ matrix.triple }}
+
+      - name: Upload agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.triple }}
+          path: agent/target/${{ matrix.triple }}/release/kotoshelf-agent
+          if-no-files-found: error
+
   build:
+    needs: build-agents
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +125,28 @@ jobs:
 
       - name: Install frontend deps
         run: npm ci
+
+      # Every desktop build embeds every remote-target agent, not just a
+      # build matching its own platform (a Windows kotoshelf still needs
+      # to deploy a Linux/macOS agent to whatever it connects to). Local
+      # execute permissions on these staged files don't matter -
+      # ssh_agent_connect only ever reads their bytes to upload them, the
+      # remote side is what gets chmod +x'd.
+      - name: Download agent binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-*
+          path: agent-artifacts
+
+      - name: Stage agent binaries for bundling
+        run: |
+          mkdir -p src-tauri/agent-bin
+          for dir in agent-artifacts/agent-*; do
+            triple="$(basename "$dir" | sed 's/^agent-//')"
+            mkdir -p "src-tauri/agent-bin/$triple"
+            cp "$dir/kotoshelf-agent" "src-tauri/agent-bin/$triple/kotoshelf-agent"
+          done
+          find src-tauri/agent-bin -type f
 
       - name: Tauri build
         run: npm run tauri build
