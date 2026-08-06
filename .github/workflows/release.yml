@@ -123,7 +123,12 @@ jobs:
           pattern: agent-*
           path: agent-artifacts
 
+      # Explicit shell: unlike build.yml's `build` job, this job has no
+      # job-level `defaults.run.shell: bash` - the windows-latest runner
+      # defaults `run:` steps to pwsh, which can't parse this script's
+      # bash syntax ("Missing opening '(' after keyword 'for'").
       - name: Stage agent binaries for bundling
+        shell: bash
         run: |
           mkdir -p src-tauri/agent-bin
           for dir in agent-artifacts/agent-*; do
