@@ -20,6 +20,14 @@ src-tauri/gen
 agent/target
 agent-protocol/target
 
+# Prebuilt SSH agent binaries staged here by CI (build.yml's
+# build-agents job) before `tauri build` bundles them as resources -
+# not checked in, just a local/CI staging area. .gitkeep keeps the
+# directory itself present so a resource-config build doesn't need this
+# staging step to have already run.
+src-tauri/agent-bin/*
+!src-tauri/agent-bin/.gitkeep
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
