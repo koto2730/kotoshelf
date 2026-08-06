@@ -440,17 +440,22 @@ export default function App() {
     sshImageCache.current.clear();
     try {
       const config = await getAppConfig();
+      // Best-effort perf optimization - every SSH command below still
+      // works without it (falls back to its own per-operation `ssh`
+      // shell-out), so a deploy/connect failure here isn't worth
+      // surfacing as a workspace-open failure. It IS worth surfacing
+      // *somewhere* though - silently swallowing it left no way to tell
+      // "using the fast path" from "silently fell back", which made a
+      // real deploy failure indistinguishable from working-as-intended.
+      let agentNote = "agent: connected";
       try {
         await sshAgentConnect(profile, config.sshCommandPath);
-      } catch {
-        // Best-effort perf optimization - every SSH command below still
-        // works without it (falls back to its own per-operation `ssh`
-        // shell-out), so a deploy/connect failure here isn't worth
-        // surfacing as a workspace-open failure.
+      } catch (e) {
+        agentNote = `agent unavailable: ${e}`;
       }
       setTree(await sshReadTreeShallow(profile, config.sshCommandPath, ""));
       const target = profile.user ? `${profile.user}@${profile.host}` : profile.host;
-      setStatus(`Workspace (SSH): ${target}:${profile.remotePath}`);
+      setStatus(`Workspace (SSH): ${target}:${profile.remotePath} (${agentNote})`);
     } catch (e) {
       setStatus(`Failed to read remote workspace: ${e}`);
     }

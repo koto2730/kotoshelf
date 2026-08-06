@@ -1292,12 +1292,37 @@ fn ssh_agent_connect(
     );
     let _ = run_ssh_capture(&ssh_command_path, &profile, &cleanup);
 
-    let mut cmd = ssh_base_command(&ssh_command_path, &profile, true);
+    // Not multiplexed: ControlMaster reuses a connection across *separate*
+    // ssh invocations, which doesn't apply here (this one connection
+    // stays open for the agent's whole lifetime) - and combining
+    // ControlMaster with fully piped, non-tty stdio has hit the same
+    // "getsockname failed: Not a socket" flakiness `ssh_open_terminal`
+    // already works around for the same reason (see its comment).
+    let mut cmd = ssh_base_command(&ssh_command_path, &profile, false);
     cmd.arg(&remote_bin);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("Failed to start the agent: {e}"))?;
     let stdin = child.stdin.take().ok_or("Failed to open agent stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to open agent stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to open agent stderr")?;
+
+    // Drained continuously on a background thread (not read on demand)
+    // so a chatty remote-side ssh/shell (connection diagnostics, a
+    // shell's "Killed: 9" for a rejected binary, etc.) can never fill
+    // the OS pipe buffer and stall - this thread has nothing else to do
+    // but keep reading, whether or not the handshake below ever looks
+    // at what it collected.
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        let buf = stderr_buf.clone();
+        let mut stderr = stderr;
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            *buf.lock().unwrap() = s;
+        });
+    }
 
     let mut session = AgentSession {
         child,
@@ -1310,7 +1335,20 @@ fn ssh_agent_connect(
     match session.call(agent_protocol::RequestBody::Ping) {
         Ok(agent_protocol::ResponseBody::Pong) => {}
         Ok(_) => return Err("Unexpected response to agent handshake".into()),
-        Err(e) => return Err(format!("Agent handshake failed: {e}")),
+        Err(e) => {
+            // The remote process has typically already exited by the
+            // time the handshake fails (that's usually *why* it fails),
+            // so its stderr is already fully drained into the buffer -
+            // this brief wait is just for the drain thread to finish
+            // writing it, not for the process itself.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let stderr_text = stderr_buf.lock().unwrap().trim().to_string();
+            return Err(if stderr_text.is_empty() {
+                format!("Agent handshake failed: {e}")
+            } else {
+                format!("Agent handshake failed: {e} (remote stderr: {stderr_text})")
+            });
+        }
     }
 
     // Replaces (Drop cleans up) whatever session - if any - was live
