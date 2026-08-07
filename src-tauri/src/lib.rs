@@ -1174,6 +1174,31 @@ fn agent_read_tree_shallow(
     }
 }
 
+/// Ends the live agent session (if any): asks it to exit gracefully
+/// (`Shutdown`, which it acks with `Ok` and then exits its own dispatch
+/// loop - see agent/src/main.rs) so the remote process ends cleanly
+/// rather than being cut off mid-request, then lets `AgentSession`'s
+/// `Drop` (kill + wait on the local ssh child) run as a guaranteed
+/// backstop regardless of whether the graceful request actually landed
+/// (e.g. the connection was already dead). Called both when switching
+/// away from an SSH workspace and, via the app's exit handler, when
+/// kotoshelf itself is closing - relying on `Drop` alone for the latter
+/// isn't guaranteed to run on every shutdown path, and without an
+/// explicit disconnect the local `ssh` child (and the remote agent
+/// process it's keeping alive) can outlive the app as an orphan, since
+/// Windows doesn't kill child processes when their parent exits.
+fn agent_disconnect(state: &AgentRegistry) {
+    let mut guard = state.0.lock().unwrap();
+    if let Some(mut session) = guard.take() {
+        let _ = session.call(agent_protocol::RequestBody::Shutdown);
+    }
+}
+
+#[tauri::command]
+fn ssh_agent_disconnect(state: tauri::State<AgentRegistry>) {
+    agent_disconnect(&state);
+}
+
 /// Maps `uname -sm` output to the prebuilt agent's Rust target triple.
 /// `None` for anything not covered yet (Windows remotes are out of
 /// scope for the agent - see the SSH-perf plan - and any architecture
@@ -2123,10 +2148,21 @@ pub fn run() {
             ssh_replace_in_files,
             ssh_test_connection,
             ssh_open_terminal,
-            ssh_agent_connect
+            ssh_agent_connect,
+            ssh_agent_disconnect
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // The one thing this handler exists for: make sure a live
+            // agent session doesn't outlive the app. See
+            // agent_disconnect's doc comment for why Drop alone isn't
+            // trusted to cover this.
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                agent_disconnect(&app_handle.state::<AgentRegistry>());
+            }
+        });
 }
 
 #[cfg(test)]
@@ -2168,6 +2204,13 @@ mod tests {
         // "is the live agent session still for *this* workspace").
         a.name = "renamed".into(); // name isn't part of the connection identity
         assert_eq!(agent_session_key(&a), agent_session_key(&a.clone()));
+    }
+
+    #[test]
+    fn agent_disconnect_on_an_empty_registry_does_not_panic() {
+        let registry = AgentRegistry::default();
+        agent_disconnect(&registry);
+        assert!(registry.0.lock().unwrap().is_none());
     }
 
     #[test]

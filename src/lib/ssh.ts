@@ -221,6 +221,17 @@ export function sshAgentConnect(profile: SshProfile, sshCommandPath: string): Pr
   return invoke("ssh_agent_connect", { profile, sshCommandPath });
 }
 
+/** Ends the live agent session, if any - a no-op otherwise. Called when
+ * leaving an SSH workspace (for a local one, or another SSH profile -
+ * ssh_agent_connect also replaces any prior session on its own, but
+ * calling this first means one never sits connected-but-unused). The
+ * app's own exit handler calls the Rust side of this directly, so a
+ * session doesn't rely on a renderer-side call happening at all to get
+ * cleaned up on quit. */
+export function sshAgentDisconnect(): Promise<void> {
+  return invoke("ssh_agent_disconnect");
+}
+
 /** Opens a new terminal window already `cd`'d into the remote workspace
  * folder over SSH (Windows Terminal / Terminal.app / a common Linux
  * emulator, depending on platform). */
