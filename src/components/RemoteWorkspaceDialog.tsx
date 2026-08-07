@@ -70,6 +70,17 @@ export function RemoteWorkspaceDialog({
   const connect = async () => {
     if (!selected) return;
     setError(null);
+    // The Host field's placeholder ("watcher-pi.tail6ca2de.ts.net") is a
+    // realistic-looking example, easy to mistake at a glance for an
+    // already-filled-in value on a fresh profile - an empty host then
+    // reaches ssh as an empty/missing target, which fails with a
+    // low-level, uninformative error ("banner exchange: Connection to
+    // UNKNOWN port -1"). Catching it here first gives a message that
+    // actually points at the fix.
+    if (!selected.host.trim()) {
+      setError("Host is required (the greyed-out text is just an example, not a saved value).");
+      return;
+    }
     setConnecting(true);
     try {
       await persist(profiles);
