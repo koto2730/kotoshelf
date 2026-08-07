@@ -87,6 +87,7 @@ import { ThemeDialog } from "./components/ThemeDialog";
 import { RemoteWorkspaceDialog } from "./components/RemoteWorkspaceDialog";
 import {
   sshAgentConnect,
+  sshAgentDisconnect,
   sshListAllPaths,
   sshReadFileGuarded,
   sshReadTreeShallow,
@@ -411,6 +412,10 @@ export default function App() {
   }, [workspace, expanded, loadDirShallow, loadRootShallow]);
 
   const openWorkspaceAt = useCallback(async (path: string) => {
+    // No-op if there wasn't an SSH session (or already disconnected) -
+    // safe to fire unconditionally rather than tracking "were we in SSH
+    // mode" ourselves.
+    void sshAgentDisconnect().catch(() => {});
     setWorkspaceKind("local");
     setSshProfile(null);
     setWorkspace(path);
