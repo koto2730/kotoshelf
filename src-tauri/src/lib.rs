@@ -789,13 +789,27 @@ fn run_ssh_capture_attempt(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Called before every stale-socket retry below. Deleting the socket
+/// file covers a stale/corrupted ControlMaster (e.g. the remote host
+/// rebooted mid-session); the sleep is for a different, since-observed
+/// failure mode that an instant retry doesn't help with at all - the
+/// very first connection attempt right after the local machine (or
+/// 1Password) just started can fail with `sign_and_send_pubkey: ...
+/// communication with agent failed` because 1Password's own SSH-agent
+/// service isn't fully up yet, and succeed moments later with no other
+/// change. Retrying instantly just reproduces the same failure; this
+/// gives whatever wasn't ready a couple seconds to become so.
+fn prepare_stale_socket_retry(profile: &SshProfile) {
+    if let Some(path) = ssh_control_path(profile) {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+}
+
 /// On failure, retries once over a fresh, non-multiplexed connection
-/// after clearing this profile's ControlMaster socket - covers a stale
-/// or corrupted socket file (e.g. the remote host rebooted mid-session)
-/// so the app self-heals instead of failing every call until the user
-/// manually deletes `~/.kotoshelf/ssh-sockets/`. If the retry also
-/// fails, that failure (not the first one) is what's reported - it
-/// reflects the actual connection, without multiplexing noise.
+/// (see `prepare_stale_socket_retry`). If the retry also fails, that
+/// failure (not the first one) is what's reported - it reflects the
+/// actual connection, without multiplexing noise.
 fn run_ssh_capture(
     ssh_command_path: &str,
     profile: &SshProfile,
@@ -804,9 +818,7 @@ fn run_ssh_capture(
     match run_ssh_capture_attempt(ssh_command_path, profile, remote_script, true) {
         Ok(out) => Ok(out),
         Err(_) => {
-            if let Some(path) = ssh_control_path(profile) {
-                let _ = std::fs::remove_file(&path);
-            }
+            prepare_stale_socket_retry(profile);
             run_ssh_capture_attempt(ssh_command_path, profile, remote_script, false)
         }
     }
@@ -833,8 +845,8 @@ fn run_ssh_capture_bytes_attempt(
     Ok(output.stdout)
 }
 
-/// Binary-safe counterpart to run_ssh_capture, with the same stale-socket
-/// self-healing retry.
+/// Binary-safe counterpart to run_ssh_capture, with the same
+/// stale-socket/not-ready-yet self-healing retry.
 fn run_ssh_capture_bytes(
     ssh_command_path: &str,
     profile: &SshProfile,
@@ -843,9 +855,7 @@ fn run_ssh_capture_bytes(
     match run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, true) {
         Ok(out) => Ok(out),
         Err(_) => {
-            if let Some(path) = ssh_control_path(profile) {
-                let _ = std::fs::remove_file(&path);
-            }
+            prepare_stale_socket_retry(profile);
             run_ssh_capture_bytes_attempt(ssh_command_path, profile, remote_script, false)
         }
     }
@@ -882,8 +892,9 @@ fn run_ssh_with_stdin_attempt(
     Ok(())
 }
 
-/// Same stale-socket self-healing as `run_ssh_capture` (see its doc
-/// comment) applied to the stdin-piping path used by writes.
+/// Same self-healing retry as `run_ssh_capture` (see
+/// `prepare_stale_socket_retry`) applied to the stdin-piping path used
+/// by writes.
 fn run_ssh_with_stdin(
     ssh_command_path: &str,
     profile: &SshProfile,
@@ -893,9 +904,7 @@ fn run_ssh_with_stdin(
     match run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, true) {
         Ok(()) => Ok(()),
         Err(_) => {
-            if let Some(path) = ssh_control_path(profile) {
-                let _ = std::fs::remove_file(&path);
-            }
+            prepare_stale_socket_retry(profile);
             run_ssh_with_stdin_attempt(ssh_command_path, profile, remote_script, input, false)
         }
     }
